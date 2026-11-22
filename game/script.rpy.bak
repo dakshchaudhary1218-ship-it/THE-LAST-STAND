@@ -1,0 +1,1883 @@
+default laststand = None
+
+init python:
+    import math
+    import random
+    from renpy import pygame
+
+    WORLD_W = 3000
+    WORLD_H = 2200
+    VIEW_W = 1280
+    VIEW_H = 720
+    ARENA_ZOOM = 1.24
+    ACTOR_ZOOM = 1.23
+    SURVIVOR_ZOOM = 1.05
+    MAX_ACTIVE_ZOMBIES = 32
+    # The source sheets put each tiny character in the middle of a 100px tile.
+    # Crop that empty border before scaling so zombies read clearly in combat.
+    ZOMBIE_SPRITE_CELL = 64
+    ZOMBIE_SPRITE_SCALE = 2.0
+    ZOMBIE_SPRITE_COUNTS = {
+        "blood": {"walk": 8, "idle": 6, "attack1": 8, "attack2": 8, "hurt": 4, "death": 4},
+        "demon": {"walk": 8, "idle": 6, "attack1": 7, "attack2": 7, "hurt": 4, "death": 4},
+        "demon_venom": {"walk": 8, "idle": 6, "attack1": 7, "attack2": 7, "hurt": 4, "death": 4},
+        "demon_frost": {"walk": 8, "idle": 6, "attack1": 7, "attack2": 7, "hurt": 4, "death": 4},
+        "demon_void": {"walk": 8, "idle": 6, "attack1": 7, "attack2": 7, "hurt": 4, "death": 4},
+    }
+
+    renpy.music.register_channel("zombie_voice", "sfx", loop=False)
+    renpy.music.set_volume(0.42, channel="zombie_voice")
+
+    WEAPONS = {
+        "pistol": {"name": "SERVICE PISTOL", "mag_size": 12, "damage": 34, "rate": 0.24, "reload": 1.15, "spread": 0.035, "pellets": 1, "range": 720, "reserve_start": 36, "mark": "P"},
+        "shotgun": {"name": "BREACH SHOTGUN", "mag_size": 6, "damage": 24, "rate": 0.72, "reload": 1.55, "spread": 0.22, "pellets": 7, "range": 390, "reserve_start": 12, "mark": "S"},
+        "rifle": {"name": "PATROL RIFLE", "mag_size": 30, "damage": 19, "rate": 0.105, "reload": 1.55, "spread": 0.07, "pellets": 1, "range": 800, "reserve_start": 45, "mark": "R"},
+        "smg": {"name": "COMPACT SMG", "mag_size": 24, "damage": 14, "rate": 0.075, "reload": 1.35, "spread": 0.105, "pellets": 1, "range": 650, "reserve_start": 72, "mark": "M"},
+        "marksman": {"name": "SCOUT RIFLE", "mag_size": 8, "damage": 68, "rate": 0.48, "reload": 1.8, "spread": 0.008, "pellets": 1, "range": 1100, "reserve_start": 24, "mark": "D"},
+    }
+    WEAPON_UNLOCKS = {"shotgun": 150, "smg": 250, "rifle": 350, "marksman": 550}
+
+    CITY_BUILDINGS = []
+    for _row in range(4):
+        for _col in range(4):
+            _building_w = 428 + ((_row * 3 + _col) % 4) * 14
+            _building_h = 304 + ((_row + _col * 2) % 3) * 18
+            CITY_BUILDINGS.append((100 + _col * 700, 70 + _row * 535, _building_w, _building_h))
+
+    CITY_CARS = [
+        (650, 455, 94, 48), (1360, 1000, 48, 92), (2050, 1080, 94, 48),
+        (570, 1540, 48, 94), (2150, 480, 94, 48), (1350, 1750, 94, 48),
+        (2760, 1410, 48, 94), (870, 1990, 94, 48),
+    ]
+    CITY_BARRIERS = [
+        (1210, 420, 82, 16), (1970, 890, 88, 16), (720, 1275, 76, 16),
+        (2670, 910, 82, 16), (1960, 1740, 92, 16), (1120, 1830, 80, 16),
+    ]
+    # Collision and spawn clearance include the visible wall depth and cast shadow.
+    CITY_OBSTACLES = [(bx - 12, by - 12, bw + 45, bh + 62) for bx, by, bw, bh in CITY_BUILDINGS] + CITY_CARS + CITY_BARRIERS
+
+    CITY_DECALS = []
+    _detail_rng = random.Random(58117)
+    for _i in range(1000):
+        _x = _detail_rng.randrange(28, WORLD_W - 28)
+        _y = _detail_rng.randrange(28, WORLD_H - 28)
+        if any(_x > ox - 22 and _x < ox + ow + 22 and _y > oy - 22 and _y < oy + oh + 22 for ox, oy, ow, oh in CITY_OBSTACLES):
+            continue
+        CITY_DECALS.append((_x, _y, _detail_rng.choice(("crack", "puddle", "debris", "scuff")),
+                            _detail_rng.randrange(5, 24), _detail_rng.random() * math.tau))
+
+    def ls_clamp(value, low, high):
+        return max(low, min(high, value))
+
+    def ls_rect(canvas, color, x, y, w, h, width=0):
+        canvas.rect(color, (int(x), int(y), max(1, int(w)), max(1, int(h))), width)
+
+    def ls_circle(canvas, color, x, y, radius, width=0):
+        canvas.circle(color, (int(x), int(y)), max(1, int(radius)), width)
+
+    def ls_line(canvas, color, x1, y1, x2, y2, width=1):
+        canvas.line(color, (int(x1), int(y1)), (int(x2), int(y2)), width)
+
+    def ls_polygon(canvas, color, points, width=0):
+        canvas.polygon(color, [(int(x), int(y)) for x, y in points], width)
+
+    def ls_rotated_point(x, y, angle, local_x, local_y):
+        ca = math.cos(angle)
+        sa = math.sin(angle)
+        return (x + local_x * ca - local_y * sa, y + local_x * sa + local_y * ca)
+
+    def ls_rotated_polygon(canvas, color, x, y, angle, points, width=0):
+        canvas.polygon(color, [tuple(int(round(v)) for v in ls_rotated_point(x, y, angle, px, py)) for px, py in points], width)
+
+    def ls_rotated_rect(canvas, color, x, y, angle, width, height, line_width=0):
+        hw, hh = width / 2.0, height / 2.0
+        ls_rotated_polygon(canvas, color, x, y, angle,
+                           [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)], line_width)
+
+    def ls_rotated_oval(canvas, color, x, y, angle, center_x, center_y, radius_x, radius_y):
+        points = []
+        for i in range(12):
+            a = math.tau * i / 12.0
+            points.append(ls_rotated_point(x, y, angle, center_x + math.cos(a) * radius_x, center_y + math.sin(a) * radius_y))
+        canvas.polygon(color, [tuple(int(round(v)) for v in p) for p in points])
+
+    def ls_soft_ellipse(canvas, color, x, y, radius_x, radius_y, angle=0.0):
+        """A smooth-enough filled ellipse for broad pools of reflected light."""
+        points = []
+        for i in range(32):
+            a = math.tau * i / 32.0
+            points.append(ls_rotated_point(x, y, angle, math.cos(a) * radius_x, math.sin(a) * radius_y))
+        ls_polygon(canvas, color, points)
+
+    def ls_light_fan(canvas, x, y, angle, length, half_angle, color):
+        points = [(x, y)]
+        for i in range(25):
+            a = angle - half_angle + 2.0 * half_angle * i / 24.0
+            points.append((x + math.cos(a) * length, y + math.sin(a) * length))
+        ls_polygon(canvas, color, points)
+
+    def ls_lamp_strength(world_x, world_y):
+        strength = 0.0
+        for index in range(18):
+            lamp_x = 320 + (index % 6) * 490
+            lamp_y = 455 + (index // 6) * 570
+            distance = math.hypot(world_x - lamp_x, world_y - lamp_y)
+            strength = max(strength, 1.0 - distance / 220.0)
+        return ls_clamp(strength, 0.0, 1.0)
+
+    def ls_spotlight_strength(source_x, source_y, target_x, target_y, angle):
+        dx, dy = target_x - source_x, target_y - source_y
+        distance = math.hypot(dx, dy)
+        if distance <= 0.0 or distance >= 490.0:
+            return 0.0
+        delta = math.atan2(math.sin(math.atan2(dy, dx) - angle),
+                           math.cos(math.atan2(dy, dx) - angle))
+        return ls_clamp((1.0 - distance / 490.0) * (1.0 - abs(delta) / 0.34), 0.0, 1.0)
+
+    def ls_warm_tint(color, strength):
+        strength = ls_clamp(strength, 0.0, 1.0)
+        return (ls_clamp(int(color[0] + 28 * strength), 0, 255),
+                ls_clamp(int(color[1] + 14 * strength), 0, 255),
+                ls_clamp(int(color[2] - 5 * strength), 0, 255))
+
+    def ls_roof_unit(canvas, x, y, width, height, depth, top_color, front_color, side_color):
+        """Draw a compact rooftop fixture with a visible lit top and two faces."""
+        ls_polygon(canvas, front_color, [(x, y + height), (x + width, y + height),
+                                        (x + width + depth, y + height + depth * 0.55),
+                                        (x + depth, y + height + depth * 0.55)])
+        ls_polygon(canvas, side_color, [(x + width, y), (x + width + depth, y + depth * 0.55),
+                                       (x + width + depth, y + height + depth * 0.55),
+                                       (x + width, y + height)])
+        ls_rect(canvas, top_color, x, y, width, height)
+        ls_line(canvas, (133, 132, 113), x + 2, y + 2, x + width - 3, y + 2, 1)
+        ls_line(canvas, (103, 103, 89), x + width - 2, y + 3, x + width - 2, y + height - 3, 1)
+
+    def ls_rotated_line(canvas, color, x, y, angle, x1, y1, x2, y2, width=1):
+        p1 = ls_rotated_point(x, y, angle, x1, y1)
+        p2 = ls_rotated_point(x, y, angle, x2, y2)
+        ls_line(canvas, color, p1[0], p1[1], p2[0], p2[1], width)
+
+    def ls_segment_distance_squared(x1, y1, x2, y2, px, py):
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0.0001:
+            return (px - x1) ** 2 + (py - y1) ** 2
+        t = ls_clamp(((px - x1) * dx + (py - y1) * dy) / length_sq, 0.0, 1.0)
+        cx, cy = x1 + t * dx, y1 + t * dy
+        return (px - cx) ** 2 + (py - cy) ** 2
+
+    class LSZoomCanvas(object):
+        """Zooms arena artwork around the camera center without scaling the HUD."""
+
+        def __init__(self, canvas, zoom, center_x, center_y):
+            self.canvas = canvas
+            self.zoom = zoom
+            self.center_x = center_x
+            self.center_y = center_y
+
+        def point(self, x, y):
+            return (self.center_x + (x - self.center_x) * self.zoom,
+                    self.center_y + (y - self.center_y) * self.zoom)
+
+        def final_point(self, x, y):
+            x, y = self.point(x, y)
+            if isinstance(self.canvas, LSZoomCanvas):
+                return self.canvas.final_point(x, y)
+            return (x, y)
+
+        def rect(self, color, rect, width=0):
+            x, y, w, h = rect
+            x, y = self.point(x, y)
+            return self.canvas.rect(color, (int(x), int(y), max(1, int(w * self.zoom)), max(1, int(h * self.zoom))),
+                                    max(1, int(width * self.zoom)) if width else 0)
+
+        def circle(self, color, pos, radius, width=0):
+            x, y = self.point(pos[0], pos[1])
+            return self.canvas.circle(color, (int(x), int(y)), max(1, int(radius * self.zoom)),
+                                      max(1, int(width * self.zoom)) if width else 0)
+
+        def line(self, color, start, end, width=1):
+            x1, y1 = self.point(start[0], start[1])
+            x2, y2 = self.point(end[0], end[1])
+            return self.canvas.line(color, (int(x1), int(y1)), (int(x2), int(y2)), max(1, int(width * self.zoom)))
+
+        def polygon(self, color, points, width=0):
+            scaled = [tuple(int(v) for v in self.point(x, y)) for x, y in points]
+            return self.canvas.polygon(color, scaled, max(1, int(width * self.zoom)) if width else 0)
+
+    def ls_sfx(name, channel="sound"):
+        renpy.play("audio/%s.wav" % name, channel=channel)
+
+    class SurvivorRun(object):
+        """State and rules for the top-down LAST STAND arcade run."""
+
+        def __init__(self):
+            self.reset()
+
+        def reset(self):
+            self.px, self.py = 1450.0, 1090.0
+            self.health = 100.0
+            self.weapon = "pistol"
+            self.mag = {key: (weapon["mag_size"] if key == "pistol" else 0) for key, weapon in WEAPONS.items()}
+            self.reserve = {key: (weapon["reserve_start"] if key == "pistol" else 0) for key, weapon in WEAPONS.items()}
+            self.unlocked = {key: (key == "pistol") for key in WEAPONS}
+            self.score = 0
+            self.kills = 0
+            self.wave = 1
+            self.spawn_left = 14
+            self.spawn_direction_index = random.randrange(8)
+            self.spawn_timer = 0.28
+            self.between_waves = 0.0
+            self.zombies = []
+            self.corpses = []
+            self.bullets = []
+            self.enemy_bullets = []
+            self.pickups = []
+            self.particles = []
+            self.floaters = []
+            self.shockwave_ready = False
+            self.shockwave = None
+            self.shot_timer = 0.0
+            self.reload_timer = 0.0
+            self.reloading = False
+            self.speed_timer = 0.0
+            self.invulnerability = 0.0
+            self.shake = 0.0
+            self.total_time = 0.0
+            self.toast = ""
+            self.toast_timer = 0.0
+            self.banner_timer = 1.7
+            self.banner = "WAVE 01"
+            self.game_over = False
+            self.anim_time = 0.0
+            self.flash_time = 0.0
+            self.groan_timer = random.uniform(4.0, 7.0)
+
+        def camera(self):
+            return (ls_clamp(self.px - VIEW_W / 2.0, 0, WORLD_W - VIEW_W),
+                    ls_clamp(self.py - VIEW_H / 2.0, 0, WORLD_H - VIEW_H))
+
+        def blocked(self, x, y, radius, projectile=False):
+            if x < radius + 18 or y < radius + 18 or x > WORLD_W - radius - 18 or y > WORLD_H - radius - 18:
+                return True
+            obstacles = CITY_BUILDINGS + CITY_CARS + CITY_BARRIERS if projectile else CITY_OBSTACLES
+            for ox, oy, ow, oh in obstacles:
+                nx = ls_clamp(x, ox, ox + ow)
+                ny = ls_clamp(y, oy, oy + oh)
+                if (x - nx) ** 2 + (y - ny) ** 2 < radius ** 2:
+                    return True
+            return False
+
+        def move(self, x, y, radius):
+            if not self.blocked(self.px + x, self.py, radius):
+                self.px += x
+            if not self.blocked(self.px, self.py + y, radius):
+                self.py += y
+
+        def notify(self, message, seconds=2.0):
+            self.toast = message
+            self.toast_timer = seconds
+
+        def spawn_zombie(self):
+            cx, cy = self.camera()
+            viewport_x = cx + VIEW_W / 2.0
+            viewport_y = cy + VIEW_H / 2.0
+            half_view_w = VIEW_W / (2.0 * ARENA_ZOOM) + 20
+            half_view_h = VIEW_H / (2.0 * ARENA_ZOOM) + 20
+            # Advance around eight compass sectors so new packs press from every side.
+            first_sector = self.spawn_direction_index % 8
+            self.spawn_direction_index = (self.spawn_direction_index + 1) % 8
+            candidate = None
+            fallback = None
+            for sector_offset in range(8):
+                sector = (first_sector + sector_offset) % 8
+                angle = sector * math.tau / 8.0 + random.uniform(-0.12, 0.12)
+                for distance in (380, 460, 540, 620, 720):
+                    x = ls_clamp(self.px + math.cos(angle) * distance, 36, WORLD_W - 36)
+                    y = ls_clamp(self.py + math.sin(angle) * distance, 36, WORLD_H - 36)
+                    on_screen = (viewport_x - half_view_w <= x <= viewport_x + half_view_w
+                                 and viewport_y - half_view_h <= y <= viewport_y + half_view_h)
+                    if self.blocked(x, y, 18):
+                        continue
+                    if fallback is None:
+                        fallback = (x, y)
+                    if not on_screen:
+                        candidate = (x, y)
+                        break
+                if candidate is not None:
+                    break
+            if candidate is None:
+                candidate = fallback
+            if candidate is None:
+                # Rare last resort for a player trapped among blocked sectors.
+                open_tiles = []
+                for y in range(48, WORLD_H, 64):
+                    for x in range(48, WORLD_W, 64):
+                        if not self.blocked(x, y, 18):
+                            open_tiles.append((x, y))
+                open_tiles.sort(key=lambda p: (p[0] - self.px) ** 2 + (p[1] - self.py) ** 2, reverse=True)
+                candidate = random.choice(open_tiles[:min(16, len(open_tiles))])
+            x, y = candidate
+            # New threats enter in stages so every silhouette and behavior has room to read.
+            weights = [("normal", 1.0)]
+            if self.wave >= 3:
+                weights.append(("runner", 0.28))
+            if self.wave >= 4:
+                weights.append(("stalker", 0.14))
+            if self.wave >= 5:
+                weights.append(("armored", 0.18))
+            if self.wave >= 7:
+                weights.append(("brute", 0.12))
+            if self.wave >= 9:
+                weights.append(("spitter", 0.14))
+            roll = random.random() * sum(weight for _, weight in weights)
+            kind = "normal"
+            for candidate_kind, weight in weights:
+                roll -= weight
+                if roll <= 0:
+                    kind = candidate_kind
+                    break
+            if kind == "runner":
+                hp, speed, radius, damage, color = 58 + self.wave * 3, 112 + self.wave * 1.5, 13, 12, (177, 158, 100)
+            elif kind == "armored":
+                hp, speed, radius, damage, color = 150 + self.wave * 9, 42 + self.wave, 19, 21, (111, 130, 122)
+            elif kind == "stalker":
+                hp, speed, radius, damage, color = 64 + self.wave * 4, 78 + self.wave * 1.5, 12, 13, (105, 126, 111)
+            elif kind == "brute":
+                hp, speed, radius, damage, color = 230 + self.wave * 17, 29 + self.wave * 0.7, 24, 28, (118, 91, 71)
+            elif kind == "spitter":
+                hp, speed, radius, damage, color = 92 + self.wave * 5, 45 + self.wave, 16, 10, (119, 145, 95)
+            else:
+                hp, speed, radius, damage, color = 78 + self.wave * 4, 53 + min(self.wave, 14) * 1.7, 15, 15, (119, 145, 119)
+            # Demon_A has three additional palette mutations generated from its
+            # supplied animation sheets. Keep Blood Monster_A in the mix, while
+            # making demon forms the common threat and the brute's signature.
+            demon_forms = ("demon", "demon_venom", "demon_frost", "demon_void")
+            if kind == "brute":
+                sprite_model = random.choice(demon_forms + ("demon", "blood"))
+            else:
+                sprite_model = random.choice(demon_forms + ("demon", "blood", "blood"))
+            kind_sprite_scale = {"runner": 0.88, "stalker": 0.94, "armored": 1.10,
+                                 "brute": 1.20, "spitter": 1.04}.get(kind, 1.0)
+            sprite_scale = kind_sprite_scale * random.uniform(0.94, 1.06)
+            self.zombies.append({"x": x, "y": y, "kind": kind, "hp": hp, "max_hp": hp,
+                                 "speed": speed, "radius": radius, "damage": damage, "color": color,
+                                 "attack_wait": random.uniform(0.2, 0.8), "angle": 0.0, "anim": random.random() * 6.0,
+                                 "flash": 0.0, "hurt_anim": 0.0, "attack_anim": 0.0,
+                                 "sprite_model": sprite_model, "sprite_flip": random.choice((True, False)),
+                                 "sprite_scale": sprite_scale, "sidestep": random.choice((-1, 1)),
+                                 "variant": random.randrange(5)})
+
+        def start_reload(self):
+            if self.reloading:
+                return
+            w = WEAPONS[self.weapon]
+            if self.mag[self.weapon] >= w["mag_size"] or self.reserve[self.weapon] <= 0:
+                if self.reserve[self.weapon] <= 0:
+                    self.notify("NO RESERVE AMMUNITION")
+                return
+            self.reloading = True
+            self.reload_timer = w["reload"]
+            self.notify("RELOADING", w["reload"])
+            ls_sfx("reload")
+
+        def finish_reload(self):
+            w = WEAPONS[self.weapon]
+            needed = w["mag_size"] - self.mag[self.weapon]
+            amount = min(needed, self.reserve[self.weapon])
+            self.mag[self.weapon] += amount
+            self.reserve[self.weapon] -= amount
+            self.reloading = False
+            self.notify("MAGAZINE READY", 1.0)
+
+        def switch_weapon(self, key):
+            if not self.unlocked[key]:
+                score_needed = WEAPON_UNLOCKS.get(key, 0)
+                self.notify("UNLOCKS AT %d POINTS" % score_needed)
+                return
+            self.weapon = key
+            self.reloading = False
+            self.reload_timer = 0.0
+            ls_sfx("pickup")
+
+        def fire(self, mouse_x, mouse_y):
+            if self.shot_timer > 0 or self.reloading:
+                return
+            w = WEAPONS[self.weapon]
+            if self.mag[self.weapon] <= 0:
+                if self.reserve[self.weapon] > 0:
+                    self.start_reload()
+                else:
+                    self.notify("OUT OF AMMO — FIND SUPPLIES")
+                self.shot_timer = 0.25
+                return
+            self.mag[self.weapon] -= 1
+            self.shot_timer = w["rate"]
+            ls_sfx(self.weapon)
+            cx, cy = self.camera()
+            player_screen_x = VIEW_W / 2.0 + (self.px - cx - VIEW_W / 2.0) * ARENA_ZOOM
+            player_screen_y = VIEW_H / 2.0 + (self.py - cy - VIEW_H / 2.0) * ARENA_ZOOM
+            angle = math.atan2(mouse_y - player_screen_y, mouse_x - player_screen_x)
+            for _ in range(w["pellets"]):
+                a = angle + random.uniform(-w["spread"], w["spread"])
+                self.bullets.append({"x": self.px + math.cos(a) * 26, "y": self.py + math.sin(a) * 26,
+                                     "vx": math.cos(a) * 900, "vy": math.sin(a) * 900,
+                                     "life": w["range"] / 900.0, "damage": w["damage"], "weapon": self.weapon})
+            self.shake = max(self.shake, 9 if self.weapon == "marksman" else 7 if self.weapon == "shotgun" else 3)
+            self.flash_time = 0.15 if self.weapon in ("shotgun", "marksman") else 0.11
+            for _ in range(8 if self.weapon in ("shotgun", "marksman") else 5):
+                self.particles.append({"x": self.px + math.cos(angle) * 28, "y": self.py + math.sin(angle) * 28,
+                                       "vx": math.cos(angle + random.uniform(-0.8, 0.8)) * random.uniform(35, 150),
+                                       "vy": math.sin(angle + random.uniform(-0.8, 0.8)) * random.uniform(35, 150),
+                                       "life": random.uniform(0.08, 0.2), "size": random.randint(2, 5), "color": (245, 192, 101)})
+
+        def drop_pickup(self, x=None, y=None, forced_kind=None):
+            if x is None:
+                for distance in (160, 220, 290, 360, 120, 420):
+                    placed = False
+                    for _ in range(24):
+                        angle = random.random() * math.tau
+                        x = ls_clamp(self.px + math.cos(angle) * distance, 60, WORLD_W - 60)
+                        y = ls_clamp(self.py + math.sin(angle) * distance, 60, WORLD_H - 60)
+                        if not self.blocked(x, y, 14):
+                            placed = True
+                            break
+                    if placed:
+                        break
+                if self.blocked(x, y, 14):
+                    x, y = self.px, self.py
+            if forced_kind is None:
+                kinds = ["pistol", "pistol", "health", "speed"]
+                for weapon in WEAPONS:
+                    if weapon != "pistol" and self.unlocked[weapon]:
+                        kinds.append(weapon)
+                has_wave_pickup = any(pickup["kind"] == "shockwave" for pickup in self.pickups)
+                if not self.shockwave_ready and not has_wave_pickup:
+                    kinds.extend(("shockwave", "shockwave"))
+                kind = random.choice(kinds)
+            else:
+                kind = forced_kind
+            self.pickups.append({"x": x, "y": y, "kind": kind, "age": 0.0, "life": 30.0})
+
+        def collect_pickup(self, pickup):
+            kind = pickup["kind"]
+            if kind == "health":
+                before = self.health
+                self.health = min(100, self.health + 32)
+                self.notify("MEDKIT +%d HEALTH" % int(self.health - before) if self.health > before else "HEALTH ALREADY FULL")
+            elif kind == "speed":
+                self.speed_timer = 8.0
+                self.notify("ADRENALINE BOOST")
+            elif kind == "shockwave":
+                self.shockwave_ready = True
+                self.notify("WAVE CHARGED - PRESS E", 3.0)
+            else:
+                amount = {"pistol": 18, "shotgun": 8, "rifle": 24, "smg": 36, "marksman": 12}[kind]
+                self.reserve[kind] += amount
+                self.notify("%s AMMO +%d" % (kind.upper(), amount))
+            ls_sfx("pickup")
+
+        def trigger_shockwave(self):
+            if not self.shockwave_ready or self.game_over:
+                return
+            self.shockwave_ready = False
+            farthest_zombie = max((math.hypot(zombie["x"] - self.px, zombie["y"] - self.py)
+                                   for zombie in self.zombies), default=0.0)
+            self.shockwave = {"age": 0.0, "duration": 1.15,
+                              "radius": 0.0, "max_radius": max(900.0, farthest_zombie + 60.0)}
+            self.invulnerability = max(self.invulnerability, 1.15)
+            self.shake = max(self.shake, 18.0)
+            self.notify("SHOCKWAVE RELEASED", 2.0)
+            ls_sfx("wave")
+            for i in range(56):
+                angle = math.tau * i / 56.0 + random.uniform(-0.06, 0.06)
+                speed = random.uniform(240, 500)
+                self.particles.append({"x": self.px, "y": self.py,
+                                       "vx": math.cos(angle) * speed, "vy": math.sin(angle) * speed,
+                                       "life": random.uniform(0.55, 1.0), "size": random.randint(2, 5),
+                                       "color": (91, 230, 220) if i % 3 else (239, 199, 112)})
+
+        def hurt(self, amount):
+            if self.invulnerability > 0:
+                return
+            self.health = max(0, self.health - amount)
+            self.invulnerability = 0.58
+            self.shake = max(self.shake, 9)
+            self.floaters.append({"x": self.px, "y": self.py - 28, "text": "-%d" % amount, "life": 0.7, "bad": True})
+            ls_sfx("hurt")
+            if self.health <= 0:
+                self.game_over = True
+
+        def hit_zombie(self, zombie, amount, quiet=False):
+            if not hasattr(self, "corpses"):
+                self.corpses = []
+            zombie["hp"] -= amount
+            zombie["flash"] = 0.12
+            zombie["hurt_anim"] = 0.34
+            self.floaters.append({"x": zombie["x"], "y": zombie["y"] - 20, "text": str(int(amount)), "life": 0.55})
+            if not quiet:
+                ls_sfx("hit")
+            if zombie["hp"] <= 0:
+                self.corpses.append({"x": zombie["x"], "y": zombie["y"],
+                                     "angle": zombie.get("angle", 0.0),
+                                     "sprite_model": zombie.get("sprite_model", "blood"), "age": 0.0})
+                if zombie in self.zombies:
+                    self.zombies.remove(zombie)
+                points = {"normal": 20, "runner": 30, "armored": 40, "stalker": 32, "brute": 65, "spitter": 45}.get(zombie["kind"], 20)
+                self.kills += 1
+                self.score += points
+                self.floaters.append({"x": zombie["x"], "y": zombie["y"] - 32, "text": "+%d" % points, "life": 0.8, "good": True})
+                if random.random() < 0.12:
+                    self.drop_pickup(zombie["x"], zombie["y"])
+                for weapon, score_needed in WEAPON_UNLOCKS.items():
+                    if self.score >= score_needed and not self.unlocked[weapon]:
+                        self.unlocked[weapon] = True
+                        self.mag[weapon] = WEAPONS[weapon]["mag_size"]
+                        self.reserve[weapon] = WEAPONS[weapon]["reserve_start"]
+                        weapon_slot = list(WEAPONS).index(weapon) + 1
+                        self.notify("%s UNLOCKED - PRESS %d" % (WEAPONS[weapon]["name"], weapon_slot), 3.0)
+
+        def tick(self, dt, keys, mouse, firing):
+            if self.game_over:
+                return
+            dt = min(max(dt, 0.0), 0.05)
+            self.total_time += dt
+            self.anim_time += dt
+            self.shot_timer = max(0.0, self.shot_timer - dt)
+            self.invulnerability = max(0.0, self.invulnerability - dt)
+            self.speed_timer = max(0.0, self.speed_timer - dt)
+            self.shake = max(0.0, self.shake - 26.0 * dt)
+            self.banner_timer = max(0.0, self.banner_timer - dt)
+            self.toast_timer = max(0.0, self.toast_timer - dt)
+            self.flash_time = max(0.0, getattr(self, "flash_time", 0.0) - dt)
+            for corpse in list(getattr(self, "corpses", [])):
+                corpse["age"] += dt
+                if corpse["age"] >= 0.56:
+                    self.corpses.remove(corpse)
+            self.groan_timer -= dt
+            if self.groan_timer <= 0:
+                if self.zombies:
+                    ls_sfx("groan", "zombie_voice")
+                self.groan_timer = random.uniform(7.0, 11.0)
+            if self.reloading:
+                self.reload_timer -= dt
+                if self.reload_timer <= 0:
+                    self.finish_reload()
+
+            dx = int(pygame.K_d in keys or pygame.K_RIGHT in keys) - int(pygame.K_a in keys or pygame.K_LEFT in keys)
+            dy = int(pygame.K_s in keys or pygame.K_DOWN in keys) - int(pygame.K_w in keys or pygame.K_UP in keys)
+            if dx or dy:
+                length = math.hypot(dx, dy)
+                sprint = pygame.K_LSHIFT in keys or pygame.K_RSHIFT in keys or self.speed_timer > 0
+                speed = 260.0 if sprint else 180.0
+                self.move(dx / length * speed * dt, dy / length * speed * dt, 16)
+            if firing:
+                self.fire(mouse[0], mouse[1])
+
+            if self.shockwave is not None:
+                wave = self.shockwave
+                wave["age"] += dt
+                progress = min(1.0, wave["age"] / wave["duration"])
+                wave["radius"] = wave["max_radius"] * progress
+                for zombie in list(self.zombies):
+                    distance = math.hypot(zombie["x"] - self.px, zombie["y"] - self.py)
+                    if distance <= wave["radius"] + zombie.get("radius", 15):
+                        self.hit_zombie(zombie, zombie["hp"] + 1, quiet=True)
+                if progress >= 1.0:
+                    # Guarantee the clear at the end of the expanding front.
+                    for zombie in list(self.zombies):
+                        self.hit_zombie(zombie, zombie["hp"] + 1, quiet=True)
+                    self.shockwave = None
+
+            for zombie in list(self.zombies):
+                zombie["anim"] += dt * (12.0 if zombie["kind"] in ("runner", "stalker") else 7.0)
+                zombie["flash"] = max(0.0, zombie["flash"] - dt)
+                zombie["hurt_anim"] = max(0.0, zombie.get("hurt_anim", 0.0) - dt)
+                zombie["attack_anim"] = max(0.0, zombie.get("attack_anim", 0.0) - dt)
+                zombie["attack_wait"] -= dt
+                vx = self.px - zombie["x"]
+                vy = self.py - zombie["y"]
+                distance = max(0.01, math.hypot(vx, vy))
+                zombie["angle"] = math.atan2(vy, vx)
+                preferred_range = 275 if zombie["kind"] == "spitter" else zombie["radius"] + 24
+                if distance > preferred_range:
+                    ox, oy = zombie["x"], zombie["y"]
+                    mx = vx / distance * zombie["speed"] * dt
+                    my = vy / distance * zombie["speed"] * dt
+                    if not self.blocked(zombie["x"] + mx, zombie["y"], zombie["radius"]):
+                        zombie["x"] += mx
+                    if not self.blocked(zombie["x"], zombie["y"] + my, zombie["radius"]):
+                        zombie["y"] += my
+                    if math.hypot(zombie["x"] - ox, zombie["y"] - oy) < 0.05:
+                        # Keep a preferred direction around obstacles so a zombie
+                        # doesn't oscillate in place when it meets a building edge.
+                        side = zombie.get("sidestep", 1)
+                        for turn in (side, -side):
+                            sx = -vy / distance * zombie["speed"] * dt * turn
+                            sy = vx / distance * zombie["speed"] * dt * turn
+                            if not self.blocked(zombie["x"] + sx, zombie["y"], zombie["radius"]):
+                                zombie["x"] += sx
+                            if not self.blocked(zombie["x"], zombie["y"] + sy, zombie["radius"]):
+                                zombie["y"] += sy
+                            if math.hypot(zombie["x"] - ox, zombie["y"] - oy) >= 0.05:
+                                zombie["sidestep"] = turn
+                                break
+                elif zombie["attack_wait"] <= 0:
+                    zombie["attack_anim"] = 0.66
+                    if zombie["kind"] == "spitter":
+                        self.enemy_bullets.append({"x": zombie["x"], "y": zombie["y"],
+                                                   "vx": vx / distance * 255, "vy": vy / distance * 255,
+                                                   "life": 2.1, "damage": zombie["damage"]})
+                        zombie["attack_wait"] = 2.0
+                    else:
+                        self.hurt(zombie["damage"])
+                        zombie["attack_wait"] = 0.72 if zombie["kind"] in ("runner", "stalker") else 1.2
+
+            for shot in list(self.enemy_bullets):
+                start_x, start_y = shot["x"], shot["y"]
+                end_x = start_x + shot["vx"] * dt
+                end_y = start_y + shot["vy"] * dt
+                shot["life"] -= dt
+                if self.blocked(end_x, end_y, 3, projectile=True) or shot["life"] <= 0:
+                    self.enemy_bullets.remove(shot)
+                elif ls_segment_distance_squared(start_x, start_y, end_x, end_y, self.px, self.py) < 22 ** 2:
+                    self.hurt(shot["damage"])
+                    self.enemy_bullets.remove(shot)
+                else:
+                    shot["x"], shot["y"] = end_x, end_y
+
+            for bullet in list(self.bullets):
+                start_x, start_y = bullet["x"], bullet["y"]
+                end_x = start_x + bullet["vx"] * dt
+                end_y = start_y + bullet["vy"] * dt
+                bullet["life"] -= dt
+                distance = math.hypot(end_x - start_x, end_y - start_y)
+                steps = max(1, int(distance / 5.0) + 1)
+                hit = False
+                for step in range(1, steps + 1):
+                    t = float(step) / steps
+                    bx = start_x + (end_x - start_x) * t
+                    by = start_y + (end_y - start_y) * t
+                    if self.blocked(bx, by, 2, projectile=True):
+                        bullet["x"], bullet["y"] = bx, by
+                        hit = True
+                        break
+                    for zombie in list(self.zombies):
+                        reach = zombie["radius"] + 3
+                        if ls_segment_distance_squared(start_x, start_y, bx, by, zombie["x"], zombie["y"]) <= reach * reach:
+                            self.hit_zombie(zombie, bullet["damage"])
+                            hit = True
+                            break
+                    if hit:
+                        bullet["x"], bullet["y"] = bx, by
+                        break
+                if not hit:
+                    bullet["x"], bullet["y"] = end_x, end_y
+                if hit or bullet["life"] <= 0:
+                    if bullet in self.bullets:
+                        self.bullets.remove(bullet)
+                    if hit:
+                        self.particles.append({"x": bullet["x"], "y": bullet["y"], "vx": random.uniform(-30, 30), "vy": random.uniform(-30, 30), "life": 0.14, "size": 3, "color": (213, 177, 109)})
+
+            for pickup in list(self.pickups):
+                pickup["age"] += dt
+                pickup["life"] -= dt
+                if pickup["life"] <= 0:
+                    self.pickups.remove(pickup)
+                elif math.hypot(self.px - pickup["x"], self.py - pickup["y"]) < 30:
+                    self.collect_pickup(pickup)
+                    self.pickups.remove(pickup)
+
+            for particle in list(self.particles):
+                particle["x"] += particle["vx"] * dt
+                particle["y"] += particle["vy"] * dt
+                particle["life"] -= dt
+                if particle["life"] <= 0:
+                    self.particles.remove(particle)
+            for floater in list(self.floaters):
+                floater["y"] -= 28 * dt
+                floater["life"] -= dt
+                if floater["life"] <= 0:
+                    self.floaters.remove(floater)
+
+            # Keep late waves playable on slower machines while allowing the
+            # remaining wave spawns to flow in as the player clears the horde.
+            if self.shockwave is not None:
+                pass
+            elif self.spawn_left > 0 and len(self.zombies) < MAX_ACTIVE_ZOMBIES:
+                self.spawn_timer -= dt
+                if self.spawn_timer <= 0:
+                    self.spawn_zombie()
+                    self.spawn_left -= 1
+                    self.spawn_timer = max(0.16, 0.52 - self.wave * 0.018)
+            elif not self.zombies:
+                if self.between_waves <= 0:
+                    self.between_waves = 4.5
+                    has_wave_pickup = any(pickup["kind"] == "shockwave" for pickup in self.pickups)
+                    if not self.shockwave_ready and not has_wave_pickup:
+                        self.drop_pickup(forced_kind="shockwave")
+                    else:
+                        self.drop_pickup()
+                    self.notify("STREET CLEARED — SUPPLIES INBOUND")
+                self.between_waves -= dt
+                if self.between_waves <= 0:
+                    self.wave += 1
+                    self.spawn_left = 18 if self.wave == 2 else 24 if self.wave == 3 else 30 + (self.wave - 4) * 8
+                    self.between_waves = 0
+                    self.banner = "WAVE %02d" % self.wave
+                    self.banner_timer = 1.7
+                    ls_sfx("wave")
+
+    class ArenaDisplayable(renpy.Displayable):
+        """Layered city arena with pixel-art enemies and combat input."""
+
+        def __init__(self, run, **kwargs):
+            super(ArenaDisplayable, self).__init__(**kwargs)
+            self.run = run
+            self.keys = set()
+            self.mouse = (VIEW_W * 0.72, VIEW_H * 0.48)
+            self.firing = False
+            self.last_st = None
+            self.game_over_sent = False
+            self.aim_angle = 0.0
+            self.sprite_frames = {}
+            for model, actions in ZOMBIE_SPRITE_COUNTS.items():
+                self.sprite_frames[model] = {}
+                for action, frame_count in actions.items():
+                    source = "images/zombies/%s_%s.png" % (model, action)
+                    self.sprite_frames[model][action] = [
+                        Crop((frame * 100 + 18, 18, ZOMBIE_SPRITE_CELL, ZOMBIE_SPRITE_CELL), source)
+                        for frame in range(frame_count)
+                    ]
+
+        def visit(self):
+            return [frame for actions in self.sprite_frames.values()
+                    for frames in actions.values() for frame in frames]
+
+        def event(self, ev, x, y, st):
+            self.mouse = (x, y)
+            if ev.type == pygame.KEYDOWN:
+                self.keys.add(ev.key)
+                if ev.key == pygame.K_ESCAPE:
+                    return "pause"
+                if ev.key == pygame.K_r:
+                    self.run.start_reload()
+                elif ev.key == pygame.K_e:
+                    self.run.trigger_shockwave()
+                elif ev.key == pygame.K_1:
+                    self.run.switch_weapon("pistol")
+                elif ev.key == pygame.K_2:
+                    self.run.switch_weapon("shotgun")
+                elif ev.key == pygame.K_3:
+                    self.run.switch_weapon("rifle")
+                elif ev.key == pygame.K_4:
+                    self.run.switch_weapon("smg")
+                elif ev.key == pygame.K_5:
+                    self.run.switch_weapon("marksman")
+            elif ev.type == pygame.KEYUP:
+                self.keys.discard(ev.key)
+            elif ev.type == pygame.MOUSEMOTION:
+                self.mouse = (x, y)
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                self.firing = True
+                if not self.run.game_over:
+                    self.run.fire(x, y)
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                self.firing = False
+            elif getattr(pygame, "WINDOWFOCUSLOST", -1) == ev.type:
+                self.keys.clear()
+                self.firing = False
+            renpy.redraw(self, 0)
+            # This displayable is reused behind the game-over screen. Emit the
+            # transition once so later mouse/key events cannot dismiss that screen.
+            if self.run.game_over and not self.game_over_sent:
+                self.game_over_sent = True
+                return "game_over"
+            return None
+
+        def render(self, width, height, st, at):
+            w, h = int(width), int(height)
+            if w < 2 or h < 2:
+                w, h = VIEW_W, VIEW_H
+            dt = 0 if self.last_st is None else min(max(st - self.last_st, 0), 0.05)
+            self.last_st = st
+            self.run.tick(dt, self.keys, self.mouse, self.firing)
+            renpy.timeout(1.0 / 30.0)
+            renpy.redraw(self, 1.0 / 30.0)
+            result = renpy.Render(w, h)
+            canvas = result.canvas()
+            self.draw_world(canvas, w, h, result, st, at)
+            return result
+
+        def draw_world(self, c, w, h, target, st, at):
+            run = self.run
+            cam_x, cam_y = run.camera()
+            shake_x = random.randint(-int(run.shake), int(run.shake)) if persistent.screen_shake and run.shake >= 1 else 0
+            shake_y = random.randint(-int(run.shake), int(run.shake)) if persistent.screen_shake and run.shake >= 1 else 0
+            ox, oy = -cam_x + shake_x, -cam_y + shake_y
+
+            # Keep the asphalt base full-frame, then zoom the whole world layer
+            # so the survivor, enemies, and street detail read clearly at 720p.
+            ls_rect(c, (39, 47, 46), 0, 0, w, h)
+            zoom_canvas = LSZoomCanvas(c, ARENA_ZOOM, w / 2.0, h / 2.0)
+            c = zoom_canvas
+            # City avenues and broken lane paint.
+            for row in range(4):
+                road_y = 485 + row * 535 + oy
+                ls_rect(c, (31, 39, 40), 0, road_y, w, 92)
+                ls_rect(c, (83, 83, 69), 0, road_y, w, 5)
+                ls_rect(c, (21, 29, 31), 0, road_y + 88, w, 5)
+                for wx in range(15, WORLD_W, 94):
+                    mark_x = wx + ox
+                    ls_rect(c, (153, 128, 78), mark_x, road_y + 45, 42, 3)
+                    ls_rect(c, (77, 72, 56), mark_x + 7, road_y + 46, 21, 1)
+            for col in range(4):
+                road_x = 565 + col * 700 + ox
+                ls_rect(c, (31, 39, 40), road_x, 0, 92, h)
+                ls_rect(c, (83, 83, 69), road_x, 0, 5, h)
+                ls_rect(c, (21, 29, 31), road_x + 88, 0, 5, h)
+                for wy in range(15, WORLD_H, 94):
+                    mark_y = wy + oy
+                    ls_rect(c, (153, 128, 78), road_x + 45, mark_y, 3, 42)
+                    ls_rect(c, (77, 72, 56), road_x + 46, mark_y + 7, 1, 21)
+
+            # Warm sodium lamps now lift the asphalt and broken lane paint beneath them.
+            for lamp_index in range(18):
+                lamp_x = 320 + (lamp_index % 6) * 490
+                lamp_y = 455 + (lamp_index // 6) * 570
+                pool_x, pool_y = lamp_x + ox, lamp_y + oy + 8
+                pool_angle = -0.08 + (lamp_index % 4) * 0.05
+                ls_soft_ellipse(c, (42, 48, 45), pool_x, pool_y, 108, 57, pool_angle)
+                ls_soft_ellipse(c, (45, 50, 44), pool_x, pool_y, 91, 48, pool_angle)
+                ls_soft_ellipse(c, (49, 52, 43), pool_x, pool_y, 74, 39, pool_angle)
+                ls_soft_ellipse(c, (54, 54, 43), pool_x, pool_y, 58, 30, pool_angle)
+                ls_soft_ellipse(c, (61, 58, 43), pool_x, pool_y, 42, 22, pool_angle)
+                ls_soft_ellipse(c, (70, 63, 45), pool_x, pool_y, 26, 14, pool_angle)
+                ls_soft_ellipse(c, (82, 71, 48), pool_x, pool_y, 12, 7, pool_angle)
+
+            # Broad, layered flashlight spill is painted into the ground pass.
+            # Building roofs and props drawn later naturally occlude it.
+            base_px, base_py = run.px + ox, run.py + oy
+            aim_screen_x, aim_screen_y = zoom_canvas.point(base_px, base_py)
+            aim_angle = math.atan2(self.mouse[1] - aim_screen_y, self.mouse[0] - aim_screen_x)
+            self.aim_angle = aim_angle
+            for length, spread, color in ((490, 0.34, (42, 49, 48)),
+                                          (410, 0.29, (46, 52, 49)),
+                                          (325, 0.23, (52, 56, 49)),
+                                          (230, 0.16, (61, 60, 48))):
+                ls_light_fan(c, base_px, base_py, aim_angle, length, spread, color)
+
+            # Crosswalk bars, manhole covers, drain slots and faded traffic arrows.
+            for ix in range(3):
+                for iy in range(3):
+                    sx, sy = 565 + ix * 700 + ox, 485 + iy * 535 + oy
+                    for n in range(5):
+                        ls_rect(c, (91, 92, 80), sx - 36 + n * 15, sy + 8, 7, 24)
+                    ls_circle(c, (25, 30, 29), sx + 62, sy + 64, 12)
+                    ls_circle(c, (75, 77, 68), sx + 62, sy + 64, 8, 2)
+                    for n in range(4):
+                        ls_line(c, (64, 68, 61), sx + 55, sy + 59 + n * 4, sx + 69, sy + 59 + n * 4, 1)
+
+            # Fixed road wear: cracks, oil-dark scuffs, rain puddles and small debris.
+            for x, y, kind, size, angle in CITY_DECALS:
+                sx, sy = x + ox, y + oy
+                if sx < -40 or sx > w + 40 or sy < -40 or sy > h + 40:
+                    continue
+                if kind == "puddle":
+                    ls_rotated_oval(c, (27, 39, 42), sx, sy, angle, 0, 0, size, max(3, size * 0.36))
+                    ls_rotated_oval(c, (48, 61, 60), sx, sy, angle, -2, -1, size * 0.58, max(2, size * 0.15))
+                    ls_rotated_oval(c, (91, 94, 77), sx, sy, angle, -size * 0.24, -1, size * 0.34, 1)
+                elif kind == "crack":
+                    ex = sx + math.cos(angle) * size
+                    ey = sy + math.sin(angle) * size
+                    ls_line(c, (21, 27, 26), sx, sy, ex, ey, 2)
+                    ls_line(c, (53, 57, 51), sx + 1, sy + 1, ex, ey, 1)
+                    ls_line(c, (23, 28, 27), ex, ey, ex - math.sin(angle) * size * 0.42, ey + math.cos(angle) * size * 0.42, 1)
+                    ls_line(c, (23, 28, 27), ex, ey, ex + math.sin(angle) * size * 0.34, ey - math.cos(angle) * size * 0.34, 1)
+                elif kind == "scuff":
+                    ls_rotated_oval(c, (31, 36, 34), sx, sy, angle, 0, 0, size, 3)
+                else:
+                    ls_rotated_polygon(c, (76, 70, 57), sx, sy, angle, [(-size * 0.6, -3), (size * 0.2, -5), (size * 0.7, 1), (size * 0.2, 5), (-size * 0.5, 3)])
+                    ls_line(c, (104, 96, 73), sx - size * 0.3, sy - 1, sx + size * 0.2, sy + 1, 1)
+
+            for index, (bx, by, bw, bh) in enumerate(CITY_BUILDINGS):
+                sx, sy = bx + ox, by + oy
+                if sx > w + 70 or sy > h + 70 or sx + bw < -70 or sy + bh < -70:
+                    continue
+
+                # Give every block a deep cast shadow, a south facade, and a darker east face.
+                wall_height = 34 + (index % 3) * 4
+                side_depth = 15 + (index % 2) * 3
+                base = [(77, 80, 70), (68, 79, 76), (78, 68, 64), (66, 76, 75)][index % 4]
+                ls_polygon(c, (12, 18, 19), [(sx + 9, sy + 17), (sx + bw + side_depth + 17, sy + 23),
+                                             (sx + bw + side_depth + 17, sy + bh + wall_height + 15),
+                                             (sx + 15, sy + bh + wall_height + 15)])
+                ls_polygon(c, (46, 49, 44), [(sx, sy + bh - 5), (sx + bw, sy + bh - 5),
+                                             (sx + bw + side_depth, sy + bh + wall_height),
+                                             (sx + 10, sy + bh + wall_height)])
+                ls_polygon(c, (36, 42, 41), [(sx + bw - 5, sy), (sx + bw + side_depth, sy + 9),
+                                            (sx + bw + side_depth, sy + bh + wall_height),
+                                            (sx + bw - 1, sy + bh)])
+                ls_line(c, (102, 99, 81), sx + 8, sy + bh + wall_height - 3,
+                        sx + bw + side_depth - 2, sy + bh + wall_height - 3, 2)
+                ls_line(c, (24, 30, 30), sx + bw + side_depth - 2, sy + 12,
+                        sx + bw + side_depth - 2, sy + bh + wall_height - 4, 2)
+
+                # Narrow, irregularly lit windows belong to the walls, not the roof.
+                for window_index, wx in enumerate(range(27, bw - 22, 38)):
+                    pane_x = sx + wx
+                    pane_y = sy + bh + 9 + (wall_height - 20) // 2
+                    is_lit = (index * 11 + window_index * 5) % 9 in (0, 3)
+                    if is_lit:
+                        ls_soft_ellipse(c, (55, 51, 41), pane_x + 7, pane_y + 7, 16, 9)
+                        ls_soft_ellipse(c, (72, 59, 41), pane_x + 7, pane_y + 7, 8, 4)
+                    ls_rect(c, (26, 31, 30), pane_x - 2, pane_y - 2, 19, 18)
+                    ls_rect(c, (112, 85, 52) if is_lit else (19, 29, 32), pane_x, pane_y, 15, 14)
+                    ls_rect(c, (186, 143, 82) if is_lit else (79, 100, 101), pane_x + 2, pane_y + 2, 11, 2)
+                    ls_line(c, (20, 27, 29), pane_x + 7, pane_y, pane_x + 7, pane_y + 14, 1)
+                    if is_lit:
+                        ls_rect(c, (140, 103, 60), pane_x + 3, pane_y + 5, 5, 7)
+
+                door_x = sx + bw // 2 - 9
+                door_y = sy + bh + 6
+                ls_rect(c, (33, 37, 34), door_x - 3, door_y - 2, 21, wall_height - 5)
+                ls_rect(c, (19, 27, 29), door_x, door_y + 2, 15, wall_height - 11)
+                ls_rect(c, (94, 78, 53), door_x + 3, door_y + 5, 9, 2)
+                ls_circle(c, (174, 134, 77), door_x + 12, door_y + wall_height // 2 - 3, 1)
+
+                for window_index, wy in enumerate(range(29, bh - 18, 43)):
+                    pane_x = sx + bw + 2
+                    pane_y = sy + wy
+                    is_lit = (index * 7 + window_index * 4) % 10 == 1
+                    if is_lit:
+                        ls_soft_ellipse(c, (55, 51, 41), pane_x + 7, pane_y + 9, 13, 13)
+                        ls_soft_ellipse(c, (72, 59, 41), pane_x + 7, pane_y + 9, 7, 6)
+                    ls_rect(c, (20, 27, 28), pane_x, pane_y, side_depth - 3, 18)
+                    ls_rect(c, (112, 84, 49) if is_lit else (19, 28, 31), pane_x + 2, pane_y + 2, side_depth - 7, 14)
+                    ls_line(c, (82, 98, 92), pane_x + 3, pane_y + 3, pane_x + side_depth - 6, pane_y + 3, 1)
+
+                # The roof is a raised slab with a bright parapet and shadowed edges.
+                ls_rect(c, (40, 46, 44), sx - 5, sy - 5, bw + 8, bh + 8)
+                ls_rect(c, (91, 91, 77), sx - 5, sy - 5, bw + 8, 5)
+                ls_rect(c, (79, 82, 69), sx - 5, sy - 5, 5, bh + 8)
+                ls_rect(c, (32, 39, 39), sx + bw - 4, sy + 2, 7, bh + 3)
+                ls_rect(c, (29, 35, 35), sx + 3, sy + bh - 4, bw + 3, 7)
+                ls_rect(c, base, sx, sy, bw, bh)
+                ls_rect(c, (87, 89, 76), sx + 8, sy + 8, bw - 20, 4)
+                ls_rect(c, (74, 79, 68), sx + 8, sy + 8, 4, bh - 18)
+                ls_rect(c, (45, 51, 49), sx + 12, sy + 13, bw - 25, bh - 27)
+                ls_rect(c, (62, 67, 57), sx + 18, sy + 19, bw - 39, bh - 39)
+                ls_line(c, (98, 97, 79), sx + 18, sy + 19, sx + bw - 22, sy + 19, 1)
+
+                # Roof expansion seams, drainage runs, tar repairs, and rooftop equipment.
+                for seam in range(58, bw - 22, 64):
+                    ls_line(c, (47, 53, 49), sx + seam, sy + 28, sx + seam, sy + bh - 25, 1)
+                    ls_line(c, (81, 83, 70), sx + seam + 2, sy + 28, sx + seam + 2, sy + bh - 25, 1)
+                for patch_index in range(9):
+                    patch_x = sx + 100 + ((index * 29 + patch_index * 47) % max(1, bw - 135))
+                    patch_y = sy + 69 + ((index * 19 + patch_index * 31) % max(1, bh - 94))
+                    patch_w = 12 + ((index + patch_index) % 5) * 6
+                    patch_h = 4 + ((index * 2 + patch_index) % 3) * 2
+                    ls_rect(c, (43, 49, 47) if patch_index % 2 else (52, 57, 50), patch_x, patch_y, patch_w, patch_h)
+                    if patch_index % 3 == 0:
+                        ls_line(c, (91, 90, 75), patch_x + 2, patch_y + patch_h + 2,
+                                patch_x + patch_w - 2, patch_y + patch_h + 2, 1)
+
+                front_unit_x = sx + 28 + (index % 3) * 13
+                front_unit_y = sy + 31 + (index % 2) * 17
+                ls_roof_unit(c, front_unit_x, front_unit_y, 51, 34, 8, (83, 85, 73), (49, 54, 49), (58, 63, 56))
+                unit_x = sx + bw - 112 - (index % 3) * 8
+                unit_y = sy + 24 + (index % 4) * 7
+                ls_roof_unit(c, unit_x, unit_y, 58, 40, 9, (74, 79, 72), (41, 48, 47), (50, 57, 55))
+                for vent_index in range(3):
+                    vent_x = unit_x + 8 + vent_index * 15
+                    ls_rect(c, (35, 42, 42), vent_x, unit_y + 6, 8, 27)
+                    ls_line(c, (119, 119, 101), vent_x + 1, unit_y + 8, vent_x + 6, unit_y + 8, 1)
+                    ls_line(c, (81, 88, 79), vent_x + 1, unit_y + 14, vent_x + 6, unit_y + 14, 1)
+
+                # Roof access hatch, water tank, conduit, and weather staining vary by block.
+                hatch_x = sx + 122 + (index % 3) * 18
+                hatch_y = sy + bh - 79
+                ls_rect(c, (39, 46, 44), hatch_x, hatch_y, 48, 34)
+                ls_rect(c, (93, 91, 75), hatch_x + 5, hatch_y + 5, 37, 23)
+                ls_rect(c, (38, 45, 44), hatch_x + 10, hatch_y + 10, 26, 13)
+                ls_line(c, (115, 105, 81), hatch_x + 8, hatch_y + 7, hatch_x + 39, hatch_y + 7, 1)
+                tank_x = sx + bw - 77 - (index % 3) * 17
+                tank_y = sy + bh - 62 - (index % 2) * 12
+                ls_soft_ellipse(c, (37, 43, 41), tank_x + 3, tank_y + 5, 27, 16)
+                ls_soft_ellipse(c, (84, 84, 72), tank_x, tank_y, 24, 14)
+                ls_soft_ellipse(c, (55, 62, 57), tank_x, tank_y + 2, 19, 10)
+                ls_line(c, (118, 113, 94), tank_x - 18, tank_y - 2, tank_x + 16, tank_y - 2, 1)
+                ls_line(c, (40, 47, 44), sx + 91, sy + 91, sx + 129, sy + 110, 2)
+                ls_line(c, (40, 47, 44), sx + 129, sy + 110, sx + 111, sy + 145, 2)
+                ls_line(c, (47, 53, 49), sx + bw - 146, sy + bh - 102, sx + bw - 66, sy + bh - 102, 1)
+
+            car_colors = [(68, 77, 70), (83, 66, 55), (79, 77, 61), (59, 72, 73)]
+            for i, (x, y, cw, ch) in enumerate(CITY_CARS):
+                sx, sy = x + ox + cw / 2.0, y + oy + ch / 2.0
+                length, width = max(cw, ch), min(cw, ch)
+                angle = 0 if cw > ch else math.pi / 2.0
+                body = [(-length/2+7,-width/2),(length/2-10,-width/2),(length/2,-width/2+8),
+                        (length/2,width/2-8),(length/2-10,width/2),(-length/2+7,width/2),
+                        (-length/2,width/2-8),(-length/2,-width/2+8)]
+                shadow = [(px + 3, py + 5) for px, py in body]
+                ls_rotated_polygon(c, (13, 17, 17), sx, sy, angle, shadow)
+                ls_rotated_polygon(c, (43, 50, 47), sx, sy, angle, body)
+                ls_rotated_polygon(c, car_colors[i % len(car_colors)], sx, sy, angle,
+                                   [(-length/2+6,-width/2+3),(length/2-11,-width/2+3),(length/2-3,-width/2+9),
+                                    (length/2-3,width/2-9),(length/2-11,width/2-3),(-length/2+6,width/2-3)])
+                # Four road tires, pressed close to the wheel arches.
+                for wheel_x in (-length*0.29, length*0.29):
+                    for wheel_y in (-width/2-1, width/2+1):
+                        ls_rotated_rect(c, (12, 15, 16), sx + math.cos(angle)*wheel_x - math.sin(angle)*wheel_y,
+                                        sy + math.sin(angle)*wheel_x + math.cos(angle)*wheel_y, angle, 18, 7)
+                # Windshield, rear glass, hood and roof seams.
+                ls_rotated_polygon(c, (24, 34, 35), sx, sy, angle, [(-length*.23,-width*.34),(length*.18,-width*.34),(length*.25,0),(length*.18,width*.34),(-length*.23,width*.34),(-length*.29,0)])
+                ls_rotated_polygon(c, (46, 58, 56), sx, sy, angle, [(-length*.18,-width*.28),(length*.05,-width*.28),(length*.11,0),(length*.05,width*.28),(-length*.18,width*.28),(-length*.24,0)])
+                ls_rotated_polygon(c, (25, 34, 35), sx, sy, angle, [(length*.25,-width*.28),(length*.39,-width*.24),(length*.43,0),(length*.39,width*.24),(length*.25,width*.28),(length*.18,0)])
+                ls_rotated_line(c, (26, 33, 32), sx, sy, angle, -length*.27, 0, length*.43, 0, 2)
+                ls_rotated_line(c, (107, 106, 88), sx, sy, angle, -length*.19, -width*.25, length*.02, -width*.25, 1)
+                ls_rotated_line(c, (32, 39, 37), sx, sy, angle, -length*.27, -width*.42, length*.25, -width*.42, 1)
+                ls_rotated_line(c, (32, 39, 37), sx, sy, angle, -length*.27, width*.42, length*.25, width*.42, 1)
+                for light_y in (-width*.31, width*.31):
+                    lx, ly = ls_rotated_point(sx, sy, angle, length*.46, light_y)
+                    ls_circle(c, (175, 143, 83), lx, ly, 3)
+                for tail_y in (-width*.31, width*.31):
+                    tx, ty = ls_rotated_point(sx, sy, angle, -length*.46, tail_y)
+                    ls_rect(c, (120, 54, 43), tx - 2, ty - 2, 4, 4)
+                if i in (1, 4, 6):
+                    ls_polygon(c, (23, 28, 27), [(sx-8,sy-5),(sx+7,sy-9),(sx+18,sy-3),(sx+11,sy+5),(sx-3,sy+7)])
+                    ls_line(c, (93, 83, 64), sx - 18, sy + 9, sx + 20, sy + 8, 1)
+
+            for bx, by, bw, bh in CITY_BARRIERS:
+                sx, sy = bx + ox, by + oy
+                ls_rect(c, (29, 34, 31), sx + 4, sy + 5, bw, bh)
+                ls_rect(c, (133, 105, 58), sx, sy, bw, bh - 4)
+                for mark in range(0, int(bw), 20):
+                    ls_rect(c, (64, 68, 60) if mark % 40 else (196, 153, 76), sx + mark, sy, 9, bh - 4)
+
+            # Lamp posts, cast shadows, and bright bulbs over the larger light pools.
+            for i in range(18):
+                lx = 320 + (i % 6) * 490
+                ly = 455 + (i // 6) * 570
+                sx, sy = lx + ox, ly + oy
+                ls_rotated_oval(c, (20, 25, 25), sx + 8, sy + 10, 0.18, 9, 3, 33, 8)
+                ls_line(c, (24, 30, 30), sx + 2, sy + 1, sx + 24, sy + 12, 3)
+                ls_line(c, (79, 78, 63), sx + 3, sy, sx + 24, sy + 10, 1)
+                ls_rect(c, (25, 31, 31), sx - 2, sy - 3, 5, 17)
+                ls_rect(c, (58, 58, 47), sx - 1, sy - 3, 2, 16)
+                ls_circle(c, (73, 61, 42), sx, sy - 3, 9)
+                ls_circle(c, (133, 101, 58), sx, sy - 3, 6)
+                ls_circle(c, (233, 187, 105), sx, sy - 3, 3)
+
+            for pickup in run.pickups:
+                px, py = pickup["x"] + ox, pickup["y"] + oy + math.sin(pickup["age"] * 3) * 4
+                tint = ((150, 185, 109) if pickup["kind"] == "health" else
+                        (91, 174, 157) if pickup["kind"] == "speed" else
+                        (82, 211, 219) if pickup["kind"] == "shockwave" else (195, 160, 90))
+                ls_rect(c, (20, 25, 23), px - 12, py - 9, 24, 22)
+                ls_rect(c, tint, px - 9, py - 11, 18, 18)
+                if pickup["kind"] == "health":
+                    ls_rect(c, (24, 31, 26), px - 2, py - 8, 4, 12)
+                    ls_rect(c, (24, 31, 26), px - 6, py - 4, 12, 4)
+                elif pickup["kind"] == "shockwave":
+                    pulse = 5 + math.sin(pickup["age"] * 8.0) * 1.5
+                    ls_circle(c, (24, 47, 48), px, py, pulse + 3, 2)
+                    ls_circle(c, (229, 251, 232), px, py, pulse, 2)
+                    for spoke in range(4):
+                        angle = math.tau * spoke / 4.0 + pickup["age"] * 0.7
+                        ls_line(c, (239, 206, 126), px + math.cos(angle) * 7,
+                                py + math.sin(angle) * 7, px + math.cos(angle) * 10,
+                                py + math.sin(angle) * 10, 2)
+                else:
+                    ls_rect(c, (24, 31, 26), px - 2, py - 5, 4, 8)
+                    ls_rect(c, (24, 31, 26), px - 5, py - 2, 10, 3)
+
+            # Keep sprite sheets above the map, then place combat effects and the
+            # survivor on a final transparent pass so they remain in front.
+            sprite_layer = renpy.Render(w, h)
+            c = LSZoomCanvas(sprite_layer.canvas(), ARENA_ZOOM, w / 2.0, h / 2.0)
+            for corpse in getattr(run, "corpses", []):
+                self.draw_zombie_sprite(sprite_layer, c, corpse, ox, oy, st, at, "death")
+
+            for zombie in run.zombies:
+                self.draw_zombie_sprite(sprite_layer, c, zombie, ox, oy, st, at)
+
+            overlay_layer = renpy.Render(w, h)
+            c = LSZoomCanvas(overlay_layer.canvas(), ARENA_ZOOM, w / 2.0, h / 2.0)
+
+            if run.shockwave is not None:
+                wave_x, wave_y = run.px + ox, run.py + oy
+                wave_radius = run.shockwave["radius"]
+                ls_circle(c, (59, 200, 205), wave_x, wave_y, wave_radius, 5)
+                if wave_radius > 14:
+                    ls_circle(c, (190, 245, 226), wave_x, wave_y, wave_radius - 12, 2)
+                if wave_radius > 32:
+                    ls_circle(c, (222, 177, 101), wave_x, wave_y, wave_radius - 28, 1)
+
+            for bullet in run.bullets:
+                x, y = bullet["x"] + ox, bullet["y"] + oy
+                bullet_color = {"shotgun": (255, 207, 125), "smg": (246, 210, 151),
+                                "marksman": (255, 238, 185), "rifle": (220, 207, 150)}.get(bullet["weapon"], (250, 211, 132))
+                ls_circle(c, bullet_color, x, y, 3 if bullet["weapon"] != "rifle" else 2)
+
+            for shot in run.enemy_bullets:
+                x, y = shot["x"] + ox, shot["y"] + oy
+                ls_circle(c, (78, 93, 56), x, y, 7)
+                ls_circle(c, (164, 186, 105), x, y, 3)
+
+            for particle in run.particles:
+                x, y = particle["x"] + ox, particle["y"] + oy
+                color = particle["color"]
+                ls_rect(c, color, x, y, particle["size"], particle["size"])
+
+            self.draw_survivor(c, run, ox, oy)
+
+            for floater in run.floaters:
+                # Small vector marks keep hit feedback visible without gore.
+                x, y = floater["x"] + ox, floater["y"] + oy
+                tint = (219, 139, 108) if floater.get("bad") else (226, 197, 127)
+                ls_rect(c, tint, x - 3, y - 2, 6, 4)
+
+            # Restore the unscaled canvas for the fixed screen frame and reticle.
+            c = overlay_layer.canvas()
+            # Dark outer frame and mouse reticle.
+            ls_rect(c, (16, 22, 22), 0, 0, w, 5)
+            ls_rect(c, (16, 22, 22), 0, h - 5, w, 5)
+            mx, my = int(self.mouse[0]), int(self.mouse[1])
+            ls_circle(c, (234, 204, 139), mx, my, 8, 1)
+            ls_line(c, (234, 204, 139), mx - 14, my, mx - 5, my, 1)
+            ls_line(c, (234, 204, 139), mx + 5, my, mx + 14, my, 1)
+            ls_line(c, (234, 204, 139), mx, my - 14, mx, my - 5, 1)
+            ls_line(c, (234, 204, 139), mx, my + 5, mx, my + 14, 1)
+            target.blit(sprite_layer, (0, 0), main=False)
+            target.blit(overlay_layer, (0, 0), main=False)
+
+        def draw_zombie_sprite(self, target, c, actor, ox, oy, st, at, forced_action=None):
+            model = actor.get("sprite_model", "blood")
+            if model not in self.sprite_frames:
+                if forced_action is None:
+                    self.draw_zombie(c, actor, ox, oy)
+                return
+
+            x, y = actor["x"] + ox, actor["y"] + oy
+            angle = actor.get("angle", 0.0)
+            action = forced_action
+            if action == "death":
+                frame_index = int(actor.get("age", 0.0) * 8.0)
+            elif actor.get("hurt_anim", 0.0) > 0.0:
+                action = "hurt"
+                frame_index = int((0.34 - actor["hurt_anim"]) * 12.0)
+            elif actor.get("attack_anim", 0.0) > 0.0:
+                action = "attack2" if actor.get("variant", 0) % 2 else "attack1"
+                frame_index = int((0.66 - actor["attack_anim"]) * 12.0)
+            else:
+                distance = math.hypot(self.run.px - actor["x"], self.run.py - actor["y"])
+                preferred_range = 275 if actor.get("kind") == "spitter" else actor.get("radius", 15) + 24
+                if distance > preferred_range:
+                    action = "walk"
+                    frame_index = int(actor.get("anim", 0.0) * 1.1)
+                else:
+                    action = "idle"
+                    frame_index = int(actor.get("anim", 0.0) * 0.42)
+
+            frames = self.sprite_frames[model][action]
+            frame_index = max(0, min(len(frames) - 1, frame_index)) if action in ("hurt", "attack1", "attack2", "death") else frame_index % len(frames)
+            sprite_size = int(ZOMBIE_SPRITE_CELL * ZOMBIE_SPRITE_SCALE * actor.get("sprite_scale", 1.0) * ACTOR_ZOOM * ARENA_ZOOM)
+            sprite = Transform(frames[frame_index], xysize=(sprite_size, sprite_size),
+                               xzoom=-1.0 if actor.get("sprite_flip", False) else 1.0,
+                               rotate=(math.degrees(angle) + 90.0) % 360.0,
+                               rotate_pad=False, nearest=True)
+            sprite_render = renpy.render(sprite, sprite_size, sprite_size, st, at)
+            sprite_width, sprite_height = sprite_render.get_size()
+
+            actor_canvas = LSZoomCanvas(c, ACTOR_ZOOM, x, y)
+            ls_rotated_oval(actor_canvas, (17, 21, 20), x + 2, y + 5, angle, -1, 0, 18, 10)
+            center_x, center_y = actor_canvas.final_point(x, y)
+            target.blit(sprite_render, (int(center_x - sprite_width / 2.0),
+                                        int(center_y - sprite_height / 2.0)), main=False)
+
+            if action == "death":
+                return
+            if actor.get("hp", 0) < actor.get("max_hp", 1) or actor.get("kind") == "armored":
+                zoom = ACTOR_ZOOM * ARENA_ZOOM
+                bar_width, bar_height = max(1, int(30 * zoom)), max(1, int(4 * zoom))
+                bar_x = center_x - bar_width / 2.0
+                bar_y = center_y - (actor.get("radius", 15) + 12) * zoom
+                bar_render = renpy.Render(bar_width, bar_height)
+                bar_canvas = bar_render.canvas()
+                ls_rect(bar_canvas, (20, 24, 23), 0, 0, bar_width, bar_height)
+                fill_width = (bar_width - 2) * max(0.0, actor.get("hp", 0)) / max(1, actor.get("max_hp", 1))
+                ls_rect(bar_canvas, (153, 89, 68), 1, 1, fill_width, max(1, bar_height - 2))
+                target.blit(bar_render, (int(bar_x), int(bar_y)), main=False)
+
+        def draw_zombie(self, c, zombie, ox, oy):
+            x, y = zombie["x"] + ox, zombie["y"] + oy
+            c = LSZoomCanvas(c, ACTOR_ZOOM, x, y)
+            angle = zombie["angle"]
+            kind = zombie["kind"]
+            variant = zombie.get("variant", 0) % 5
+            stride = math.sin(zombie["anim"]) * (5.0 if kind in ("runner", "stalker") else 3.0 if kind != "brute" else 1.8)
+            skin_tones = ((158, 166, 138), (151, 155, 129), (169, 156, 130), (137, 151, 140), (165, 147, 125))
+            if kind == "runner":
+                shirt = ((90, 62, 55), (71, 72, 61), (80, 57, 52), (76, 67, 66), (83, 77, 60))[variant]
+                pants = ((51, 57, 53), (47, 49, 48), (58, 51, 45), (43, 53, 51), (54, 55, 46))[variant]
+                skin = skin_tones[(variant + 1) % 5]
+            elif kind == "armored":
+                shirt = ((41, 48, 47), (46, 51, 48), (40, 46, 52), (52, 49, 42), (38, 48, 43))[variant]
+                pants = ((44, 49, 46), (39, 43, 42), (46, 44, 40), (41, 48, 47), (48, 46, 39))[variant]
+                skin = skin_tones[(variant + 2) % 5]
+            elif kind == "stalker":
+                shirt = ((49, 61, 62), (63, 54, 62), (51, 65, 57), (56, 61, 67), (68, 58, 48))[variant]
+                pants = ((38, 45, 47), (43, 43, 48), (42, 48, 42), (36, 41, 47), (46, 41, 38))[variant]
+                skin = skin_tones[(variant + 3) % 5]
+            elif kind == "brute":
+                shirt = ((77, 57, 48), (71, 62, 53), (83, 57, 49), (66, 58, 52), (87, 69, 51))[variant]
+                pants = ((48, 45, 41), (51, 45, 43), (45, 47, 41), (50, 49, 44), (43, 43, 40))[variant]
+                skin = skin_tones[(variant + 4) % 5]
+            elif kind == "spitter":
+                shirt = ((59, 76, 57), (63, 69, 52), (54, 72, 63), (69, 67, 48), (51, 65, 55))[variant]
+                pants = ((48, 52, 43), (47, 47, 41), (44, 52, 46), (53, 48, 42), (42, 49, 44))[variant]
+                skin = skin_tones[(variant + 2) % 5]
+            else:
+                shirt = ((72, 76, 62), (81, 61, 53), (68, 76, 72), (78, 68, 60), (56, 69, 66))[variant]
+                pants = ((58, 61, 55), (51, 56, 54), (63, 54, 47), (49, 58, 56), (58, 57, 49))[variant]
+                skin = skin_tones[variant]
+            if zombie["flash"] > 0:
+                shirt = (186, 174, 146)
+                skin = (210, 198, 169)
+            illumination = max(ls_lamp_strength(zombie["x"], zombie["y"]),
+                               ls_spotlight_strength(self.run.px, self.run.py, zombie["x"], zombie["y"],
+                                                     getattr(self, "aim_angle", 0.0)))
+            if illumination > 0.0:
+                shirt = ls_warm_tint(shirt, illumination)
+                pants = ls_warm_tint(pants, illumination * 0.55)
+                skin = ls_warm_tint(skin, illumination * 0.8)
+
+            # A grounded shadow separates the body from the street.
+            ls_rotated_oval(c, (17, 21, 20), x + 2, y + 5, angle, -1, 0, 23 if kind == "brute" else 18 if kind != "armored" else 21, 12 if kind == "brute" else 10)
+            # Torn trouser legs and heavy shoes.
+            leg_width = 8 if kind == "brute" else 5 if kind != "armored" else 7
+            ls_rotated_line(c, (35, 40, 37), x, y, angle, -7, -4, -15 + stride, -8, leg_width + 2)
+            ls_rotated_line(c, pants, x, y, angle, -7, -4, -15 + stride, -8, leg_width)
+            ls_rotated_line(c, (28, 32, 31), x, y, angle, -15 + stride, -8, -19 + stride, -8, 4)
+            ls_rotated_line(c, (35, 40, 37), x, y, angle, -7, 4, -15 - stride, 8, leg_width + 2)
+            ls_rotated_line(c, pants, x, y, angle, -7, 4, -15 - stride, 8, leg_width)
+            ls_rotated_line(c, (28, 32, 31), x, y, angle, -15 - stride, 8, -19 - stride, 8, 4)
+
+            # Shoulder-to-hand anatomy; runner arms reach farther, armored arms hang heavier.
+            arm_end = 19 if kind in ("runner", "stalker") else 13 if kind == "armored" else 18 if kind == "brute" else 15
+            sag = 13 if kind not in ("armored", "brute") else 10
+            arm_width = 9 if kind == "brute" else 5 if kind != "armored" else 7
+            for sign in (-1, 1):
+                start_y = sign * 6
+                elbow_y = sign * (sag - 2) + math.sin(zombie["anim"] + sign) * 2
+                hand_y = sign * (sag + 1)
+                ls_rotated_line(c, (35, 40, 37), x, y, angle, 2, start_y, 9, elbow_y, arm_width + 2)
+                ls_rotated_line(c, shirt, x, y, angle, 2, start_y, 9, elbow_y, arm_width)
+                ls_rotated_line(c, skin, x, y, angle, 9, elbow_y, arm_end, hand_y, max(3, arm_width - 1))
+                hx, hy = ls_rotated_point(x, y, angle, arm_end + 1, hand_y)
+                ls_circle(c, skin, hx, hy, 3 if kind != "armored" else 4)
+
+            torso_length = 40 if kind == "brute" else 27 if kind in ("armored", "spitter") else 25 if kind in ("runner", "stalker") else 23
+            torso_width = 26 if kind == "brute" else 17 if kind == "armored" else 16 if kind == "spitter" else 14 if kind == "runner" else 13
+            ls_rotated_oval(c, (34, 39, 37), x, y, angle, -1, 0, torso_length / 2 + 2, torso_width / 2 + 2)
+            ls_rotated_oval(c, shirt, x, y, angle, -1, -1, torso_length / 2, torso_width / 2)
+            ls_rotated_line(c, (111, 103, 82), x, y, angle, -10, -3, 7, -3, 1)
+            ls_rotated_line(c, (40, 46, 43), x, y, angle, -9, 4, 7, 4, 2)
+            ls_rotated_line(c, (92, 94, 78), x, y, angle, -7, -5, -2, 5, 1)
+            ls_rotated_line(c, (56, 61, 54), x, y, angle, 3, -5, 8, 3, 1)
+            if variant % 3 == 0:
+                ls_rotated_polygon(c, (43, 47, 41), x, y, angle, [(-10,-6),(-5,-7),(-2,-3),(-5,0),(-11,-1)])
+            elif variant % 3 == 1:
+                ls_rotated_rect(c, (105, 87, 58), x, y, angle, 8, 3)
+
+            # Ragged hems, straps, pockets and clothing folds.
+            ls_rotated_polygon(c, (44, 48, 43), x, y, angle, [(-8,-6),(-3,-7),(-1,-3),(-4,0),(-9,-1)])
+            ls_rotated_polygon(c, (45, 49, 44), x, y, angle, [(3,4),(9,4),(8,8),(2,8)])
+            ls_rotated_line(c, (121, 112, 89), x, y, angle, -5, -5, -2, -1, 1)
+            if kind == "armored":
+                ls_rotated_rect(c, (50, 61, 59), x, y, angle, 18, 17)
+                ls_rotated_rect(c, (83, 91, 82), x, y, angle, 10, 9)
+                ls_rotated_line(c, (137, 131, 108), x, y, angle, -4, -5, 6, -5, 2)
+                ls_rotated_rect(c, (36, 44, 43), x, y, angle, 9, 5)
+                ls_rotated_line(c, (165, 145, 97), x, y, angle, -7, 0, 7, 0, 2)
+            elif kind == "brute":
+                ls_rotated_rect(c, (55, 57, 49), x, y, angle, 20, 24)
+                ls_rotated_rect(c, (97, 80, 62), x, y, angle, 13, 16)
+                ls_rotated_line(c, (137, 108, 79), x, y, angle, -11, -8, 10, -8, 2)
+                ls_rotated_line(c, (61, 46, 40), x, y, angle, -12, 6, 11, 8, 3)
+            elif kind == "stalker":
+                ls_rotated_polygon(c, (35, 42, 44), x, y, angle, [(-11,-7),(4,-9),(10,-3),(6,1),(-8,2)])
+                ls_rotated_line(c, (130, 119, 92), x, y, angle, -5, 5, 6, 6, 1)
+            elif kind == "spitter":
+                ls_rotated_polygon(c, (75, 91, 62), x, y, angle, [(-10,-8),(1,-10),(11,-6),(8,8),(-4,10),(-11,5)])
+                gx, gy = ls_rotated_point(x, y, angle, 5, -7)
+                ls_circle(c, (147, 176, 91), gx, gy, 4)
+            elif kind == "runner":
+                ls_rotated_polygon(c, (145, 126, 98), x, y, angle, [(-4,-6),(1,-7),(4,-4),(1,-1),(-3,-2)])
+                ls_rotated_line(c, (51, 54, 50), x, y, angle, -2, 6, 6, 6, 2)
+            else:
+                ls_rotated_rect(c, (69, 68, 55), x, y, angle, 14, 12)
+                ls_rotated_line(c, (120, 108, 81), x, y, angle, -4, -3, 4, -3, 1)
+
+            # Head, hairline, ears and subdued facial marks.
+            head_x, head_y = ls_rotated_point(x, y, angle, 10, -1)
+            head_radius = 8 if kind == "brute" else 7
+            ls_circle(c, (64, 69, 57), head_x + 1, head_y + 2, head_radius)
+            ls_circle(c, skin, head_x, head_y, head_radius - 1)
+            hair = ((39, 39, 34), (48, 39, 35), (40, 45, 43), (53, 46, 36), (37, 42, 43))[variant]
+            if variant in (0, 3):
+                ls_rotated_polygon(c, hair, head_x, head_y, angle,
+                                   [(-6,-3),(-4,-7),(1,-8),(6,-5),(4,-2),(0,-4),(-3,-1)])
+            elif variant == 1:
+                ls_rotated_polygon(c, hair, head_x, head_y, angle,
+                                   [(-6,-3),(-5,-7),(4,-7),(6,-3),(3,-2),(-2,-4)])
+            elif variant == 2:
+                ls_rotated_polygon(c, (58, 62, 54), head_x, head_y, angle,
+                                   [(-7,-3),(-5,-8),(2,-8),(7,-4),(6,4),(2,6),(-5,3)])
+            else:
+                ls_rotated_line(c, (183, 158, 116), x, y, angle, 9, -6, 15, -6, 1)
+            ear_x, ear_y = ls_rotated_point(x, y, angle, 10, 5)
+            ls_circle(c, (126, 113, 91), ear_x, ear_y, 2)
+            # Dark sockets with small, dull reflections make the faces read at game scale.
+            for eye_x, eye_y in ((13, -2), (14, 1)):
+                ex, ey = ls_rotated_point(x, y, angle, eye_x, eye_y)
+                ls_circle(c, (66, 59, 48), ex, ey, 2)
+                ls_circle(c, (191, 185, 143), ex, ey, 1)
+            ls_rotated_line(c, (99, 86, 69), x, y, angle, 12, -5, 16, -5, 1)
+            ls_rotated_line(c, (48, 45, 40), x, y, angle, 15, 4, 20, 4, 2)
+            ls_rotated_line(c, (124, 109, 89), x, y, angle, 16, 5, 18, 5, 1)
+            if variant in (2, 4):
+                ls_rotated_line(c, (71, 67, 56), x, y, angle, 12, -5, 10, 1, 1)
+            if kind == "armored":
+                ls_rotated_oval(c, (38, 48, 47), x, y, angle, 9, -1, 7, 7)
+                ls_rotated_rect(c, (138, 122, 91), x, y, angle, 7, 2)
+
+            # Damage cues stay muted and non-graphic.
+            if zombie.get("hp", 0) < zombie.get("max_hp", 1) or kind == "armored":
+                bar_x, bar_y = int(x - 15), int(y - zombie["radius"] - 12)
+                ls_rect(c, (20, 24, 23), bar_x, bar_y, 30, 4)
+                ls_rect(c, (153, 89, 68), bar_x + 1, bar_y + 1, 28 * max(0.0, zombie["hp"]) / zombie["max_hp"], 2)
+
+        def draw_survivor(self, c, run, ox, oy):
+            x, y = run.px + ox, run.py + oy
+            c = LSZoomCanvas(c, ACTOR_ZOOM * SURVIVOR_ZOOM, x, y)
+            aim_x, aim_y = c.final_point(x, y)
+            angle = math.atan2(self.mouse[1] - aim_y, self.mouse[0] - aim_x)
+            illumination = ls_lamp_strength(run.px, run.py)
+            moving = any(k in self.keys for k in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d,
+                                                   pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT))
+            step = math.sin(run.anim_time * 10.0) * 2.8 if moving else math.sin(run.total_time * 2.2) * 0.45
+            if run.invulnerability > 0 and int(run.total_time * 16) % 2:
+                return
+
+            # Ground contact, articulated school trousers and worn sneakers.
+            ls_rotated_oval(c, (14, 19, 19), x + 2, y + 5, angle, -1, 1, 23, 12)
+            ls_rotated_line(c, (25, 29, 37), x, y, angle, -6, -4.5, -17 + step, -7, 6)
+            ls_rotated_line(c, ls_warm_tint((62, 64, 71), illumination), x, y, angle, -8, -4.5, -16 + step, -6, 4)
+            ls_rotated_line(c, (17, 19, 24), x, y, angle, -15 + step, -6, -21 + step, -7, 4)
+            ls_rotated_line(c, (25, 29, 37), x, y, angle, -6, 4.5, -17 - step, 7, 6)
+            ls_rotated_line(c, ls_warm_tint((62, 64, 71), illumination), x, y, angle, -8, 4.5, -16 - step, 6, 4)
+            ls_rotated_line(c, (17, 19, 24), x, y, angle, -15 - step, 6, -21 - step, 7, 4)
+            for sign in (-1, 1):
+                knee_x = -12 + step * (0.3 if sign < 0 else -0.3)
+                ls_rotated_oval(c, (33, 37, 44), x, y, angle, knee_x, sign * 5.5, 4, 2.5)
+                ls_rotated_line(c, (92, 91, 89), x, y, angle, knee_x - 2, sign * 5.5,
+                                knee_x + 2, sign * 5.5, 1)
+            ls_rotated_line(c, (105, 101, 94), x, y, angle, -16 + step, -7, -19 + step, -7, 1)
+            ls_rotated_line(c, (105, 101, 94), x, y, angle, -16 - step, 7, -19 - step, 7, 1)
+
+            # A battered school backpack, with visible straps, seams and zipper.
+            ls_rotated_rect(c, (17, 20, 28), *ls_rotated_point(x, y, angle, -9, 0), angle, 16, 15)
+            ls_rotated_rect(c, ls_warm_tint((42, 46, 61), illumination),
+                            *ls_rotated_point(x, y, angle, -9, 0), angle, 13, 13)
+            ls_rotated_rect(c, (58, 61, 72), *ls_rotated_point(x, y, angle, -10, 0), angle, 8, 9)
+            ls_rotated_line(c, (112, 109, 105), x, y, angle, -14, -4, -4, -4, 1)
+            ls_rotated_line(c, (112, 109, 105), x, y, angle, -14, 4, -4, 4, 1)
+            ls_rotated_rect(c, (25, 29, 40), *ls_rotated_point(x, y, angle, -8, -6), angle, 5, 6)
+            ls_rotated_line(c, (143, 132, 112), x, y, angle, -9, -10, -9, -15, 1)
+            ls_circle(c, (168, 128, 88), *ls_rotated_point(x, y, angle, -8, -8), 1)
+
+            # School blazer over a rumpled white shirt, with lapels, tie and buttons.
+            jacket = ls_warm_tint((46, 48, 61), illumination)
+            ls_rotated_oval(c, (17, 20, 28), x, y, angle, -1, 0, 17, 10)
+            ls_rotated_oval(c, jacket, x, y, angle, -1, 0, 15, 8.5)
+            ls_rotated_polygon(c, ls_warm_tint((182, 177, 164), illumination), x, y, angle,
+                               [(-1,-4),(4,-5),(8,-2.5),(7,2.5),(3,4),(-1,3),(-3,0)])
+            ls_rotated_polygon(c, (65, 65, 79), x, y, angle,
+                               [(-7,-6),(-2,-7),(2,-4),(0,-2),(-4,-3),(-7,-2)])
+            ls_rotated_polygon(c, (65, 65, 79), x, y, angle,
+                               [(-2,-4),(4,-7),(8,-4),(7,-2),(3,-3),(1,-2)])
+            ls_rotated_polygon(c, (118, 34, 47), x, y, angle,
+                               [(1,-2),(4,-3),(5,0),(4,2),(3,7),(1,3)])
+            ls_rotated_line(c, (118, 34, 47), x, y, angle, 3, -1, 3, 5, 1)
+            ls_rotated_line(c, (107, 109, 118), x, y, angle, -6, -6, -5, 5, 1)
+            ls_rotated_line(c, (105, 105, 112), x, y, angle, 6, -4, 6, 4, 1)
+            ls_circle(c, (176, 162, 127), *ls_rotated_point(x, y, angle, -4, 0), 1)
+            ls_circle(c, (176, 162, 127), *ls_rotated_point(x, y, angle, 6, 0), 1)
+            ls_rotated_rect(c, (29, 32, 43), *ls_rotated_point(x, y, angle, -3, 0), angle, 16, 3)
+            ls_rotated_rect(c, (106, 39, 48), *ls_rotated_point(x, y, angle, -2, 0), angle, 3, 3)
+            ls_rotated_line(c, (28, 32, 44), x, y, angle, -8, -6, -13, -9, 6)
+            ls_rotated_line(c, (28, 32, 44), x, y, angle, -8, 6, -13, 9, 6)
+
+            # Raised forearms, gloves and a proper shouldered weapon silhouette.
+            skin = ls_warm_tint((169, 137, 111), illumination)
+            for sign in (-1, 1):
+                shoulder_y = sign * 6
+                elbow_y = sign * 6
+                ls_rotated_line(c, (25, 29, 41), x, y, angle, 5, shoulder_y, 12, elbow_y, 6)
+                ls_rotated_line(c, (74, 75, 89), x, y, angle, 6, shoulder_y, 12, elbow_y, 3)
+                ls_rotated_line(c, (185, 180, 167), x, y, angle, 12, elbow_y, 14, sign * 3.5, 3)
+                ls_rotated_line(c, skin, x, y, angle, 14, sign * 4, 20, sign * 3, 4)
+                gx, gy = ls_rotated_point(x, y, angle, 20, sign * 3)
+                ls_circle(c, (32, 34, 40), gx, gy, 3)
+
+            if run.weapon == "marksman":
+                ls_rotated_polygon(c, (22, 26, 27), x, y, angle,
+                                   [(-5,-3),(14,-3),(18,-2),(49,-2),(53,0),(49,2),(18,2),(11,4),(4,4),(-3,2)])
+                ls_rotated_rect(c, (108, 84, 55), *ls_rotated_point(x, y, angle, 5, 0), angle, 12, 5)
+                ls_rotated_rect(c, (45, 50, 48), *ls_rotated_point(x, y, angle, 1, 5), angle, 5, 9)
+                ls_rotated_rect(c, (157, 142, 103), *ls_rotated_point(x, y, angle, 27, -4), angle, 10, 4)
+            elif run.weapon == "smg":
+                ls_rotated_polygon(c, (24, 30, 31), x, y, angle,
+                                   [(-4,-3),(9,-3),(12,-2),(27,-2),(30,0),(27,2),(12,2),(9,4),(4,4),(-3,2)])
+                ls_rotated_rect(c, (75, 81, 70), *ls_rotated_point(x, y, angle, 5, 0), angle, 10, 5)
+                ls_rotated_rect(c, (35, 41, 40), *ls_rotated_point(x, y, angle, 14, 5), angle, 5, 9)
+                ls_rotated_rect(c, (41, 47, 44), *ls_rotated_point(x, y, angle, -3, 0), angle, 7, 6)
+            elif run.weapon == "rifle":
+                ls_rotated_polygon(c, (21, 26, 27), x, y, angle, [(-1,-2),(8,-3),(10,-5),(25,-4),(32,-2),(37,-2),(37,2),(12,2),(8,5),(4,5),(2,3),(-1,3)])
+                ls_rotated_rect(c, (69, 74, 65), *ls_rotated_point(x, y, angle, 19, 0), angle, 18, 3)
+                ls_rotated_rect(c, (24, 29, 28), *ls_rotated_point(x, y, angle, 4, 5), angle, 5, 8)
+                ls_rotated_rect(c, (35, 40, 38), *ls_rotated_point(x, y, angle, -3, 0), angle, 7, 5)
+            elif run.weapon == "shotgun":
+                ls_rotated_polygon(c, (29, 32, 29), x, y, angle, [(-3,-3),(10,-3),(14,-2),(36,-2),(38,0),(36,2),(12,2),(8,5),(2,5),(-2,2)])
+                ls_rotated_rect(c, (116, 83, 52), *ls_rotated_point(x, y, angle, 4, 0), angle, 12, 6)
+                ls_rotated_rect(c, (26, 29, 28), *ls_rotated_point(x, y, angle, 4, 5), angle, 5, 8)
+            else:
+                ls_rotated_polygon(c, (22, 27, 28), x, y, angle, [(-2,-3),(13,-3),(15,-2),(31,-2),(34,0),(31,2),(13,2),(10,4),(4,4),(1,2),(-2,2)])
+                ls_rotated_rect(c, (61, 67, 64), *ls_rotated_point(x, y, angle, 17, 0), angle, 13, 2)
+                ls_rotated_rect(c, (24, 29, 29), *ls_rotated_point(x, y, angle, 5, 5), angle, 5, 8)
+            muzzle_pos = 50 if run.weapon == "marksman" else 31 if run.weapon == "smg" else 30 if run.weapon == "rifle" else 37 if run.weapon == "shotgun" else 34
+            ls_rotated_rect(c, (107, 109, 96), *ls_rotated_point(x, y, angle, muzzle_pos, 0), angle, 5, 2)
+
+            # Keep the protagonist consistent with the story art: unruly dark
+            # hair, sharp eyes, a bruised face and the school's loosened tie.
+            ls_rotated_polygon(c, (18, 19, 26), x, y, angle,
+                               [(8,-1),(9,-5),(11,-7),(13,-6),(15,-9),(17,-7),(19,-9),
+                                (21,-6),(23,-5),(21,-2),(23,0),(21,2),(22,5),(18,7),
+                                (14,6),(11,5),(9,3)])
+            ls_rotated_oval(c, (115, 86, 76), x, y, angle, 15, 0, 7.5, 5.5)
+            ls_rotated_oval(c, ls_warm_tint((183, 143, 119), illumination), x, y, angle, 15, 0, 6.5, 4.5)
+            ls_rotated_oval(c, (54, 41, 39), x, y, angle, 11, -3.5, 2.2, 2.5)
+            ls_rotated_oval(c, (54, 41, 39), x, y, angle, 11, 3.5, 2.2, 2.5)
+            ls_rotated_oval(c, (238, 215, 195), x, y, angle, 17, -2.0, 1.9, 1.15)
+            ls_rotated_oval(c, (238, 215, 195), x, y, angle, 17, 2.0, 1.9, 1.15)
+            ls_rotated_oval(c, (35, 29, 31), x, y, angle, 17.7, -2.0, 0.8, 1.0)
+            ls_rotated_oval(c, (35, 29, 31), x, y, angle, 17.7, 2.0, 0.8, 1.0)
+            ls_rotated_line(c, (42, 31, 32), x, y, angle, 15, -3.2, 18, -2.4, 1)
+            ls_rotated_line(c, (42, 31, 32), x, y, angle, 15, 3.2, 18, 2.4, 1)
+            ls_rotated_line(c, (116, 76, 69), x, y, angle, 19, -0.5, 20, 0.5, 1)
+            ls_rotated_polygon(c, (53, 28, 34), x, y, angle,
+                               [(18,-1),(21,-0.7),(20,1),(18,1)])
+            ls_rotated_polygon(c, (18, 19, 26), x, y, angle,
+                               [(11,-4),(13,-7),(15,-5),(17,-8),(18,-5),(20,-6),
+                                (20,-3),(18,-2),(16,-3),(14,-2),(12,-2)])
+            ls_rotated_polygon(c, (18, 19, 26), x, y, angle,
+                               [(11,3),(13,5),(15,4),(17,6),(19,4),(20,2),(17,3),(15,2),(13,3)])
+            ls_rotated_line(c, (82, 77, 79), x, y, angle, 12, -5, 14, -5, 1)
+            if getattr(run, "flash_time", 0) > 0:
+                fx, fy = ls_rotated_point(x, y, angle, muzzle_pos + 5, 0)
+                ls_rotated_oval(c, (190, 127, 61), fx, fy, angle, 0, 0, 10, 7)
+                ls_rotated_oval(c, (249, 218, 143), fx, fy, angle, 3, 0, 5, 3)
+
+    class CityMenuBackdrop(renpy.Displayable):
+        """A layered, hand-drawn blackout street for the title screen."""
+
+        def render(self, width, height, st, at):
+            w, h = int(width), int(height)
+            result = renpy.Render(w, h)
+            c = result.canvas()
+            sx, sy = w / 1280.0, h / 720.0
+
+            def rect(color, x, y, rw, rh, line=0):
+                ls_rect(c, color, x * sx, y * sy, rw * sx, rh * sy, line)
+
+            def circle(color, x, y, radius, line=0):
+                ls_circle(c, color, x * sx, y * sy, radius * (sx + sy) * 0.5, line)
+
+            def line(color, x1, y1, x2, y2, weight=1):
+                ls_line(c, color, x1 * sx, y1 * sy, x2 * sx, y2 * sy, max(1, int(weight * (sx + sy) * 0.5)))
+
+            def poly(color, points):
+                ls_polygon(c, color, [(x * sx, y * sy) for x, y in points])
+
+            rect((12, 20, 21), 0, 0, 1280, 720)
+            # Low cloud cover and a thin sodium glow over the rooftops.
+            for i, color in enumerate(((14, 23, 24), (16, 26, 27), (19, 28, 28), (22, 31, 30))):
+                rect(color, 0, 175 + i * 72, 1280, 78)
+            for radius, color in ((92, (28, 34, 31)), (67, (34, 38, 33)), (42, (47, 45, 36))):
+                circle(color, 1110, 287, radius)
+            circle((129, 105, 68), 1110, 287, 25)
+            renpy.redraw(self, 0.07)
+
+            # Uneven rooflines break up the skyline; windows vary by block.
+            buildings = [
+                (-35, 216, 158, 256, (28, 37, 36)), (145, 278, 128, 194, (33, 40, 38)),
+                (290, 183, 152, 277, (29, 37, 36)), (464, 249, 115, 211, (38, 39, 35)),
+                (600, 133, 174, 327, (31, 39, 37)), (797, 234, 124, 226, (37, 40, 37)),
+                (944, 164, 165, 296, (31, 38, 37)), (1132, 211, 181, 249, (35, 40, 37)),
+            ]
+            for index, (bx, by, bw, bh, facade) in enumerate(buildings):
+                poly((10, 16, 17), [(bx - 12, by + 10), (bx + 10, by - 13), (bx + bw, by - 4), (bx + bw + 8, by + bh), (bx - 7, by + bh)])
+                rect(facade, bx, by, bw, bh)
+                rect((52, 58, 51), bx, by, bw, 5)
+                rect((18, 25, 25), bx + 8, by + 8, 3, bh - 15)
+                for row in range(max(2, bh // 42)):
+                    for col in range(max(2, bw // 28)):
+                        wx = bx + 15 + col * 27 + (row % 2) * 2
+                        wy = by + 20 + row * 39
+                        if wx + 13 >= bx + bw or wy + 19 >= by + bh:
+                            continue
+                        # A few empty panes and isolated warm rooms imply a lived-in city.
+                        if (index * 7 + row * 5 + col * 3) % 13 == 0:
+                            rect((12, 18, 18), wx, wy, 13, 19)
+                            line((36, 42, 39), wx + 2, wy + 3, wx + 10, wy + 14, 1)
+                        else:
+                            pane = (78, 80, 65) if (index + row * 3 + col) % 11 == 0 else (17, 27, 29)
+                            rect(pane, wx, wy, 13, 19)
+                            rect((52, 59, 54), wx, wy, 13, 2)
+                            line((44, 52, 49), wx + 6, wy, wx + 6, wy + 19, 1)
+                            if (row + col) % 2 == 0:
+                                line((37, 47, 47), wx + 2, wy + 6, wx + 4, wy + 11, 1)
+                if index in (2, 5, 7):
+                    # Broken roof railings and a rooftop water tank.
+                    line((16, 23, 23), bx + 19, by - 3, bx + 19, by - 27, 3)
+                    line((16, 23, 23), bx + 19, by - 25, bx + 70, by - 25, 2)
+                    rect((22, 29, 28), bx + bw - 39, by - 30, 24, 24)
+                    rect((42, 48, 43), bx + bw - 42, by - 33, 30, 4)
+                # Fire escape ladders and landing plates.
+                if index in (0, 4, 6):
+                    ex = bx + bw - 18
+                    for ey in range(by + 40, by + bh - 15, 42):
+                        line((17, 24, 25), ex, ey, ex + 12, ey, 2)
+                        line((17, 24, 25), ex + 2, ey - 20, ex + 2, ey + 9, 1)
+
+            # A hazy far skyline sits behind the nearer avenue.
+            poly((18, 27, 28), [(0, 411), (74, 384), (156, 404), (245, 368), (332, 401), (452, 370),
+                                (548, 407), (671, 374), (773, 403), (874, 370), (966, 401), (1084, 369),
+                                (1192, 394), (1280, 363), (1280, 498), (0, 498)])
+            # A small flock crosses the skyline with an actual wingbeat animation.
+            for bat_index in range(7):
+                bx = ((bat_index * 211 + st * (48 + bat_index * 8)) % 1390) - 45
+                by = 48 + bat_index * 15 + math.sin(st * 2.1 + bat_index * 1.7) * 8
+                span = 12 + (bat_index % 3) * 3
+                flap = math.sin(st * 19 + bat_index * 2.4) * 8
+                poly((5, 9, 11), [(bx, by), (bx - span * 0.5, by - 3), (bx - span, by - 9 - flap),
+                                  (bx - span + 2, by + 1), (bx - span * 0.55, by + 4), (bx - 3, by + 2),
+                                  (bx, by + 5), (bx + 3, by + 2), (bx + span * 0.55, by + 4),
+                                  (bx + span - 2, by + 1), (bx + span, by - 9 - flap),
+                                  (bx + span * 0.5, by - 3)])
+                circle((4, 7, 9), bx, by, 3)
+                poly((4, 7, 9), [(bx - 2, by - 1), (bx - 3, by - 6), (bx, by - 3)])
+                poly((4, 7, 9), [(bx + 2, by - 1), (bx + 3, by - 6), (bx, by - 3)])
+            rect((31, 38, 36), 0, 482, 1280, 238)
+            rect((112, 92, 61), 0, 479, 1280, 3)
+            # Lane edge, broken markings, curb seams, and rain-dark patches.
+            rect((20, 27, 27), 0, 505, 1280, 6)
+            rect((43, 47, 42), 0, 613, 1280, 7)
+            for x in range(30, 1280, 148):
+                rect((105, 89, 60), x, 558, 63, 3)
+                rect((26, 33, 32), x + 6, 562, 38, 1)
+            for x, y, rw, rh in ((689, 585, 89, 14), (108, 639, 113, 12), (948, 516, 72, 13), (1174, 650, 66, 10)):
+                circle((21, 29, 29), x, y, 4)
+                rect((21, 29, 29), x, y, rw, rh)
+
+            # Two streetlamps throw small, subdued pools onto the pavement.
+            for lx, ly in ((745, 503), (1198, 520)):
+                circle((40, 39, 31), lx, ly - 37, 24)
+                circle((72, 59, 38), lx, ly - 37, 12)
+                circle((153, 119, 68), lx, ly - 37, 4)
+                rect((19, 25, 25), lx - 2, ly - 35, 4, 90)
+                line((19, 25, 25), lx, ly - 34, lx + 20, ly - 43, 3)
+                line((19, 25, 25), lx + 18, ly - 43, lx + 18, ly - 36, 2)
+
+            # A wrecked car silhouette gives the street a recognizable scale cue.
+            poly((13, 20, 21), [(858, 588), (876, 568), (913, 560), (968, 565), (1001, 580), (1012, 596),
+                                (1003, 612), (870, 612), (852, 602)])
+            poly((30, 38, 37), [(881, 580), (897, 569), (924, 566), (935, 582), (900, 585)])
+            poly((25, 32, 32), [(941, 567), (964, 571), (987, 584), (947, 583)])
+            rect((9, 14, 16), 866, 601, 20, 7)
+            rect((9, 14, 16), 973, 600, 22, 7)
+            line((95, 76, 53), 860, 594, 1004, 591, 1)
+
+            # Dark figures have shoulders, hanging clothes, arms and separated legs.
+            for zx, zy, scale, angle, pose in ((837, 561, 1.05, math.pi, 0), (1061, 551, 0.88, math.pi + 0.22, 1), (1223, 572, 1.12, math.pi - 0.1, 2)):
+                ls_rotated_oval(c, (12, 17, 17), zx * sx, zy * sy, angle, 0, 12 * scale, 17 * scale * sx, 6 * scale * sy)
+                def limb(color, x1, y1, x2, y2, width):
+                    p1 = ls_rotated_point(zx * sx, zy * sy, angle, x1 * scale * sx, y1 * scale * sy)
+                    p2 = ls_rotated_point(zx * sx, zy * sy, angle, x2 * scale * sx, y2 * scale * sy)
+                    ls_line(c, color, p1[0], p1[1], p2[0], p2[1], max(2, int(width * scale * (sx + sy) * 0.5)))
+                shade = (9, 14, 15)
+                limb(shade, -5, 7, -11, 19 + pose * 2, 7)
+                limb(shade, 4, 8, 9, 21, 7)
+                limb((11, 17, 17), -11, 19 + pose * 2, -14, 21 + pose * 2, 5)
+                limb((11, 17, 17), 9, 21, 12, 22, 5)
+                # Hunched shoulder line and uneven reaching arms.
+                limb((11, 17, 17), -4, -2, -12, 2 + pose, 8)
+                limb(shade, -12, 2 + pose, -21, 7 - pose, 6)
+                limb((11, 17, 17), 3, -1, 9, 3, 8)
+                limb(shade, 9, 3, 17, 1 + pose, 6)
+                ls_rotated_oval(c, (12, 18, 18), zx * sx, zy * sy, angle, -1 * scale * sx, 0, 11 * scale * sx, 14 * scale * sy)
+                ls_rotated_oval(c, (10, 16, 16), zx * sx, zy * sy, angle, 11 * scale * sx, -1 * scale * sy, 6 * scale * sx, 7 * scale * sy)
+                ls_rotated_polygon(c, (8, 13, 14), zx * sx, zy * sy, angle,
+                                   [(-10 * scale * sx, -10 * scale * sy), (0, -12 * scale * sy), (9 * scale * sx, -8 * scale * sy),
+                                    (7 * scale * sx, 8 * scale * sy), (1 * scale * sx, 13 * scale * sy), (-9 * scale * sx, 9 * scale * sy)])
+                # A torn coat hem catches just enough light to read as clothing.
+                p1 = ls_rotated_point(zx * sx, zy * sy, angle, -8 * scale * sx, 8 * scale * sy)
+                p2 = ls_rotated_point(zx * sx, zy * sy, angle, 0, 12 * scale * sy)
+                p3 = ls_rotated_point(zx * sx, zy * sy, angle, 8 * scale * sx, 8 * scale * sy)
+                ls_line(c, (26, 32, 30), p1[0], p1[1], p2[0], p2[1], 1)
+                ls_line(c, (26, 32, 30), p2[0], p2[1], p3[0], p3[1], 1)
+
+            # Foreground curb and broken railings frame the street without hiding it.
+            rect((17, 23, 23), 0, 684, 1280, 36)
+            rect((50, 53, 46), 0, 680, 1280, 4)
+            for x in (690, 735, 780, 825, 870, 915, 960):
+                rect((17, 23, 23), x, 655, 3, 27)
+            line((17, 23, 23), 682, 656, 902, 656, 3)
+            return result
+
+    class SurvivorBulletinBoard(renpy.Displayable):
+        """A battered cork backing for the survivor's menu dossier."""
+
+        def render(self, width, height, st, at):
+            w, h = int(width), int(height)
+            result = renpy.Render(w, h)
+            c = result.canvas()
+            sx, sy = w / 500.0, h / 660.0
+            rect = lambda color, x, y, rw, rh, line=0: ls_rect(c, color, x*sx, y*sy, rw*sx, rh*sy, line)
+            line = lambda color, x1, y1, x2, y2, weight=1: ls_line(c, color, x1*sx, y1*sy, x2*sx, y2*sy, max(1, int(weight*(sx+sy)*0.5)))
+            circle = lambda color, x, y, radius: ls_circle(c, color, x*sx, y*sy, radius*(sx+sy)*0.5)
+            rect((16, 12, 10), 0, 0, 500, 660)
+            rect((91, 59, 35), 8, 8, 484, 644)
+            rect((122, 82, 49), 14, 14, 472, 632)
+            rect((67, 48, 35), 22, 22, 456, 616)
+            rect((83, 63, 45), 26, 26, 448, 608)
+            for index in range(29):
+                y = 34 + index * 21
+                x = 34 + (index * 71) % 418
+                line((75, 56, 40), x, y, x + 42 + (index % 4) * 17, y - 5 + (index % 5), 1)
+            # Pins, tape, a shell casing and faded red threat marks at the edges.
+            for px, py in ((49, 53), (451, 51), (48, 607), (453, 609), (251, 34)):
+                circle((24, 19, 16), px+1, py+2, 5)
+                circle((173, 125, 76), px, py, 3)
+            rect((165, 137, 99), 34, 77, 15, 7)
+            rect((159, 129, 92), 437, 562, 15, 7)
+            circle((149, 115, 82), 463, 323, 6)
+            circle((56, 40, 30), 463, 323, 3)
+            line((121, 69, 58), 56, 94, 104, 125, 2)
+            line((121, 69, 58), 104, 125, 71, 168, 2)
+            line((121, 69, 58), 438, 498, 392, 536, 2)
+            return result
+
+    class CityEvidenceBoard(renpy.Displayable):
+        """A hand-marked evacuation map pinned to the menu's night scene."""
+
+        def render(self, width, height, st, at):
+            w, h = int(width), int(height)
+            result = renpy.Render(w, h)
+            c = result.canvas()
+            sx, sy = w / 520.0, h / 410.0
+            rect = lambda color, x, y, rw, rh, line=0: ls_rect(c, color, x*sx, y*sy, rw*sx, rh*sy, line)
+            line = lambda color, x1, y1, x2, y2, weight=1: ls_line(c, color, x1*sx, y1*sy, x2*sx, y2*sy, max(1, int(weight*(sx+sy)*0.5)))
+            poly = lambda color, points: ls_polygon(c, color, [(int(x*sx), int(y*sy)) for x, y in points])
+            circle = lambda color, x, y, radius: ls_circle(c, color, x*sx, y*sy, radius*(sx+sy)*0.5)
+            rect((8, 11, 12), 0, 0, 520, 410)
+            rect((85, 56, 34), 9, 9, 502, 392)
+            rect((35, 28, 23), 15, 15, 490, 380)
+            rect((100, 75, 49), 20, 20, 480, 370)
+            # Cork grain and scuffs.
+            for index in range(26):
+                x = 28 + (index * 83) % 458
+                y = 28 + (index * 47) % 352
+                line((83, 59, 40), x, y, x + 13 + (index % 4) * 7, y + (index % 3) - 1, 1)
+            # A folded city map, two clipped reports, and the string connecting evidence.
+            rect((42, 52, 48), 37, 88, 207, 191)
+            rect((157, 154, 123), 42, 82, 207, 191)
+            for x in range(53, 232, 34):
+                line((120, 116, 94), x, 91, x - 9 + (x % 3) * 4, 259, 2)
+            for y in range(112, 264, 31):
+                line((112, 109, 88), 47, y, 244, y - 11, 2)
+            line((145, 58, 49), 64, 103, 168, 166, 3)
+            line((145, 58, 49), 168, 166, 215, 226, 3)
+            line((145, 58, 49), 168, 166, 95, 236, 3)
+            circle((163, 50, 42), 168, 166, 9)
+            circle((234, 199, 135), 168, 166, 3)
+            # Notes on the right, each pinned at a different angle-like offset.
+            poly((202, 190, 156), [(276, 79), (475, 83), (471, 183), (279, 178)])
+            poly((180, 168, 136), [(279, 196), (474, 192), (478, 312), (278, 316)])
+            rect((128, 95, 67), 289, 78, 13, 7)
+            rect((128, 95, 67), 455, 190, 13, 7)
+            # The route is marked by hand on the map; paper notes stay clear for legible warnings.
+            for px, py in ((40, 45), (474, 44), (45, 350), (478, 355), (261, 39)):
+                circle((32, 25, 17), px+1, py+2, 6)
+                circle((199, 147, 88), px, py, 4)
+            return result
+
+transform prologue_sunset_pan:
+    subpixel True
+    xysize (1380, 778)
+    xpos 0
+    ypos -18
+    ease 17.0 xpos -72 ypos -42
+
+transform prologue_lab_pan:
+    subpixel True
+    xysize (1380, 778)
+    xpos 0
+    ypos -18
+    ease 18.0 ypos 0
+
+transform prologue_aftermath_pan:
+    subpixel True
+    xysize (1380, 778)
+    xpos 0
+    ypos -18
+    ease 17.0 xpos -58 ypos -34
+
+transform prologue_school_pan:
+    subpixel True
+    xysize (1380, 778)
+    xpos 0
+    ypos -18
+    ease 18.0 xpos -36 ypos 0
+
+transform prologue_final_stand_pan:
+    subpixel True
+    xysize (1380, 778)
+    xpos -25
+    ypos -14
+    ease 19.0 xpos -55 ypos -26
+
+define story_narrator = Character(None, screen="prologue_say")
+define andres_story = Character("ANDRES", screen="prologue_say")
+define em_story = Character("EM", screen="prologue_say")
+
+default prologue_seen = False
+
+label story_prologue:
+    scene black
+    with Dissolve(0.8)
+    show expression "images/story_sunset.png" as prologue_art at prologue_sunset_pan
+    with Dissolve(1.0)
+    show screen prologue_hud("01 / 05", "THE LAST SUNSET")
+
+    story_narrator "Before the sirens, Andres and his crush Em still made plans for tomorrow."
+    andres_story "One last walk at sunset. Then we leave this city together."
+    em_story "You say that every night. So tonight, I'm holding you to it."
+
+    hide screen prologue_hud
+    scene black
+    with Dissolve(1.0)
+    show expression "images/story_lab_phase2.png" as prologue_art at prologue_lab_pan
+    with Dissolve(1.0)
+    show screen prologue_hud("02 / 05", "THE EVOLUTION LAB")
+    $ ls_sfx("groan", "zombie_voice")
+
+    story_narrator "The scientist called Phase Two a success. The infected in the tanks were proof of what the experiment had created."
+    story_narrator "Before sunrise, one of them broke containment and the outbreak reached the city."
+
+    hide screen prologue_hud
+    scene black
+    with Dissolve(0.9)
+    show expression "images/story_em_aftermath.jpg" as prologue_art at prologue_aftermath_pan
+    with Dissolve(1.0)
+    show screen prologue_hud("03 / 05", "THE FIRST LOSS")
+    $ ls_sfx("groan", "zombie_voice")
+
+    story_narrator "In the first hours of the outbreak, a zombie caught Em alone in the street."
+    story_narrator "Andres reached her moments after the attack. Em was already gone."
+    andres_story "Em! No... I should have been here."
+    story_narrator "The horde turned toward the distant school lights, leaving Andres with their promise."
+
+    hide screen prologue_hud
+    scene black
+    with Dissolve(0.9)
+    show expression "images/story_school_attack.jpg" as prologue_art at prologue_school_pan
+    with Dissolve(1.0)
+    show screen prologue_hud("04 / 05", "THE SCHOOL SIEGE")
+    $ ls_sfx("groan", "zombie_voice")
+
+    story_narrator "The outbreak was spreading through homes, schools, and colleges faster than anyone could escape."
+    story_narrator "At the school, students were still trapped behind the gates as the dead poured into the courtyard."
+    story_narrator "Andres turns toward the lab where Phase Two began, determined to stop it."
+    andres_story "I'll stop this. For Em, for the children, for everyone still out there."
+
+    hide screen prologue_hud
+    scene black
+    with Dissolve(0.9)
+    show expression "images/story_last_stand.jpg" as prologue_art at prologue_final_stand_pan
+    with Dissolve(1.0)
+    show screen prologue_hud("05 / 05", "THE LAST STAND")
+    $ ls_sfx("groan", "zombie_voice")
+
+    story_narrator "In the school corridor, Andres stopped running. The infected were closing in, and there was nowhere left to retreat."
+    andres_story "You want this school? Come through me!"
+    story_narrator "He held the hallway and fought through the horde, refusing to let the students fall."
+    story_narrator "One by one, the infected went down. When the last zombie fell, Andres was still standing."
+
+    $ renpy.music.stop(channel="zombie_voice", fadeout=0.35)
+    hide screen prologue_hud
+    scene black
+    with Dissolve(0.9)
+    return
+
+label prologue_skip:
+    $ renpy.music.stop(channel="zombie_voice", fadeout=0.2)
+    hide screen prologue_hud
+    scene black
+    with Dissolve(0.4)
+    return
+
+label start:
+    if not prologue_seen:
+        $ prologue_seen = True
+        call story_prologue
+    play music "audio/megalomaniac_single_mix.mp3" fadein 1.0 loop if_changed
+    call screen laststand_menu
+    if _return == "play":
+        jump new_run
+    elif _return == "howto":
+        call screen how_to_play
+        jump start
+    elif _return == "settings":
+        call screen laststand_settings
+        jump start
+    return
+
+label new_run:
+    $ laststand = SurvivorRun()
+    $ ls_sfx("wave")
+    jump gameplay_loop
+
+label gameplay_loop:
+    $ laststand_arena = ArenaDisplayable(laststand)
+    call screen gameplay(laststand, laststand_arena)
+    if _return == "pause":
+        call screen pause_menu(laststand)
+        if _return == "restart":
+            jump new_run
+        elif _return == "menu":
+            jump start
+        else:
+            jump gameplay_loop
+    elif _return == "game_over":
+        $ persistent.best_score = max(persistent.best_score or 0, laststand.score)
+        call screen game_over_screen(laststand, laststand_arena)
+        if _return == "restart":
+            jump new_run
+        else:
+            jump start
+    else:
+        jump gameplay_loop
